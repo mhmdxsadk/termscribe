@@ -1,0 +1,25 @@
+[package]
+name = "termscribe"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Copy clean Markdown transcripts of recent shell commands and their output"
+license = "MIT"
+repository = "https://github.com/mhmdxsadk/termscribe"
+readme = "README.md"
+keywords = ["terminal", "shell", "markdown", "clipboard", "zsh"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+libc = "0.2.191"
+nix = { version = "0.31.3", features = ["term", "poll", "signal", "process", "fs", "ioctl", "user"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+signal-hook = "0.4.6"
+thiserror = "2.0.21"
+
+[dev-dependencies]
+portable-pty = "0.9.0"
+tempfile = "3.27.0"
