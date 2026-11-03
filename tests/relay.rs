@@ -511,6 +511,18 @@ fn ghostty_integration_is_loaded_inside_the_relay_and_stays_out_of_transcripts()
 }
 
 #[test]
+fn doctor_reaches_the_session_and_stays_out_of_the_transcript() {
+    require_zsh!();
+    let mut s = Session::start();
+    s.run("echo one");
+    let report = s.run("termscribe doctor");
+    assert!(report.contains("ok    session"), "{report}");
+    let markdown = s.markdown(Selection::All);
+    assert!(!markdown.contains("doctor"), "{markdown}");
+    assert!(markdown.contains("$ echo one"), "{markdown}");
+}
+
+#[test]
 fn zshrc_line_starts_the_relay_and_hooks() {
     require_zsh!();
     let mut s = Session::start_with(Launch::FromZshrc);

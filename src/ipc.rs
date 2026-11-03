@@ -44,12 +44,16 @@ pub enum Request {
     },
     /// Move the boundary to now.
     Clear,
+    /// Check that the session answers. Like `Render`, the caller is a command running in the
+    /// session, so the relay forgets that command.
+    Ping,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Response {
     Rendered { markdown: String, commands: usize },
     Cleared,
+    Pong,
     Error(String),
 }
 
@@ -96,6 +100,10 @@ pub fn handle(store: &SharedStore, request: Request) -> Response {
             store.discard_pending();
             store.set_boundary();
             Response::Cleared
+        }
+        Request::Ping => {
+            lock(store).discard_pending();
+            Response::Pong
         }
     }
 }
@@ -244,6 +252,20 @@ mod tests {
             panic!("expected a rendered reply");
         };
         assert_eq!(commands, 2);
+    }
+
+    #[test]
+    fn ping_forgets_only_the_calling_command() {
+        let store = store_with(&[("a", "")]);
+        lock(&store).begin(Some("termscribe doctor".into()), None);
+        assert_eq!(handle(&store, Request::Ping), Response::Pong);
+        lock(&store).finish(Some(0));
+        let Response::Rendered { commands, .. } =
+            handle(&store, render_request(Selection::SinceBoundary))
+        else {
+            panic!("expected a rendered reply");
+        };
+        assert_eq!(commands, 1);
     }
 
     #[test]

@@ -1,0 +1,396 @@
+//! The `doctor` health check.
+
+use std::fmt::Write as _;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use crate::input::COPY_TRIGGER;
+use crate::ipc::{self, Request, Response, SOCKET_ENV};
+use crate::zshrc::{self, Presence};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Ok,
+    Warn,
+    Fail,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Check {
+    pub status: Status,
+    pub name: &'static str,
+    pub detail: String,
+}
+
+impl Check {
+    fn new(status: Status, name: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            status,
+            name,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// Runs every check against the current environment.
+pub fn run() -> Vec<Check> {
+    let mut checks = vec![check_binary(), check_zsh(), check_zshrc(), check_session()];
+    checks.push(check_clipboard());
+    checks.extend(check_ghostty());
+    checks
+}
+
+/// Formats the checks, one per line, followed by a summary line.
+pub fn render(checks: &[Check]) -> String {
+    let mut out = String::new();
+    for check in checks {
+        let label = match check.status {
+            Status::Ok => "ok",
+            Status::Warn => "warn",
+            Status::Fail => "FAIL",
+        };
+        let _ = writeln!(out, "{label:<5} {:<10} {}", check.name, check.detail);
+    }
+    let failed = count(checks, Status::Fail);
+    let warned = count(checks, Status::Warn);
+    let summary = match (failed, warned) {
+        (0, 0) => "Everything looks good.".to_string(),
+        (0, w) => format!("No problems, {w} {}.", plural(w, "warning")),
+        (f, 0) => format!("{f} {} found.", plural(f, "problem")),
+        (f, w) => format!(
+            "{f} {} and {w} {}.",
+            plural(f, "problem"),
+            plural(w, "warning")
+        ),
+    };
+    let _ = writeln!(out, "\n{summary}");
+    out
+}
+
+/// True when a check failed. Warnings do not count.
+pub fn has_failure(checks: &[Check]) -> bool {
+    count(checks, Status::Fail) > 0
+}
+
+fn count(checks: &[Check], status: Status) -> usize {
+    checks.iter().filter(|c| c.status == status).count()
+}
+
+fn plural(count: usize, noun: &str) -> String {
+    if count == 1 {
+        noun.to_string()
+    } else {
+        format!("{noun}s")
+    }
+}
+
+/// Finds an executable file called `name` in `PATH`.
+pub fn find_in_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable(candidate))
+}
+
+fn is_executable(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+fn check_binary() -> Check {
+    const NAME: &str = "binary";
+    let version = env!("CARGO_PKG_VERSION");
+    let Some(on_path) = find_in_path("termscribe") else {
+        return Check::new(
+            Status::Fail,
+            NAME,
+            "not on PATH. The .zshrc line would start a plain zsh. Add the install directory to PATH",
+        );
+    };
+    let same = std::env::current_exe()
+        .ok()
+        .zip(on_path.canonicalize().ok())
+        .is_some_and(|(running, found)| running.canonicalize().ok().as_ref() == Some(&found));
+    if same {
+        Check::new(
+            Status::Ok,
+            NAME,
+            format!("{} (version {version})", on_path.display()),
+        )
+    } else {
+        Check::new(
+            Status::Warn,
+            NAME,
+            format!(
+                "PATH runs {}, which is not this binary (version {version})",
+                on_path.display()
+            ),
+        )
+    }
+}
+
+fn check_zsh() -> Check {
+    const NAME: &str = "zsh";
+    let Some(zsh) = find_in_path("zsh") else {
+        return Check::new(Status::Fail, NAME, "zsh not found on PATH");
+    };
+    let version = Command::new(&zsh)
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .and_then(|text| {
+            let words: Vec<&str> = text.split_whitespace().take(2).collect();
+            (words.len() == 2).then(|| words.join(" "))
+        })
+        .unwrap_or_else(|| "unknown version".into());
+    let login = std::env::var("SHELL").unwrap_or_default();
+    if login.ends_with("/zsh") {
+        Check::new(Status::Ok, NAME, format!("{version} at {}", zsh.display()))
+    } else {
+        Check::new(
+            Status::Warn,
+            NAME,
+            format!(
+                "{version} at {}, but your login shell is {}. termscribe supports zsh only",
+                zsh.display(),
+                if login.is_empty() { "unset" } else { &login }
+            ),
+        )
+    }
+}
+
+fn check_zshrc() -> Check {
+    const NAME: &str = "zshrc";
+    let path = match zshrc::zshrc_path() {
+        Ok(path) => path,
+        Err(error) => return Check::new(Status::Fail, NAME, error.to_string()),
+    };
+    match zshrc::read(&path) {
+        Ok(content) => zshrc_check(&path, &content),
+        Err(error) => Check::new(Status::Fail, NAME, format!("{error:#}")),
+    }
+}
+
+fn zshrc_check(path: &Path, content: &str) -> Check {
+    const NAME: &str = "zshrc";
+    let shown = path.display();
+    match zshrc::inspect(content) {
+        Presence::First => Check::new(
+            Status::Ok,
+            NAME,
+            format!("{shown} starts with the termscribe init line"),
+        ),
+        Presence::Later(line) => Check::new(
+            Status::Warn,
+            NAME,
+            format!(
+                "the termscribe init line is on line {line} of {shown}. `termscribe setup` moves it to line 1"
+            ),
+        ),
+        Presence::Missing => Check::new(
+            Status::Fail,
+            NAME,
+            format!("the termscribe init line is not in {shown}. Run `termscribe setup`"),
+        ),
+    }
+}
+
+fn check_session() -> Check {
+    const NAME: &str = "session";
+    if std::env::var_os("TERMSCRIBE_DISABLED").is_some_and(|v| !v.is_empty()) {
+        return Check::new(
+            Status::Warn,
+            NAME,
+            "TERMSCRIBE_DISABLED is set, so new shells skip the relay",
+        );
+    }
+    let Some(socket) = std::env::var_os(SOCKET_ENV).filter(|v| !v.is_empty()) else {
+        return Check::new(
+            Status::Warn,
+            NAME,
+            "this shell is not in a termscribe session. Start a new terminal session to test it",
+        );
+    };
+    match ipc::request(Path::new(&socket), &Request::Ping) {
+        Ok(Response::Pong) => Check::new(Status::Ok, NAME, "the relay answers"),
+        Ok(other) => Check::new(
+            Status::Fail,
+            NAME,
+            format!("unexpected reply from the relay: {other:?}"),
+        ),
+        Err(error) => Check::new(Status::Fail, NAME, error.to_string()),
+    }
+}
+
+fn check_clipboard() -> Check {
+    const NAME: &str = "clipboard";
+    if let Some(file) = std::env::var_os("TERMSCRIBE_CLIPBOARD_FILE").filter(|v| !v.is_empty()) {
+        return Check::new(
+            Status::Warn,
+            NAME,
+            format!(
+                "TERMSCRIBE_CLIPBOARD_FILE writes copies to {}",
+                Path::new(&file).display()
+            ),
+        );
+    }
+    if !cfg!(target_os = "macos") {
+        return Check::new(Status::Fail, NAME, "only macOS is supported so far");
+    }
+    match find_in_path("pbcopy") {
+        Some(path) => Check::new(Status::Ok, NAME, path.display().to_string()),
+        None => Check::new(Status::Fail, NAME, "pbcopy not found on PATH"),
+    }
+}
+
+/// Ghostty checks. Returns nothing outside Ghostty.
+fn check_ghostty() -> Vec<Check> {
+    let in_ghostty = std::env::var_os("GHOSTTY_RESOURCES_DIR").is_some()
+        || std::env::var("TERM_PROGRAM").is_ok_and(|v| v == "ghostty");
+    if !in_ghostty {
+        return Vec::new();
+    }
+    let mut checks = Vec::new();
+
+    if let Some(dir) = std::env::var_os("GHOSTTY_RESOURCES_DIR") {
+        let integration = Path::new(&dir).join("shell-integration/zsh/ghostty-integration");
+        checks.push(if integration.is_file() {
+            Check::new(Status::Ok, "ghostty", "zsh integration found")
+        } else {
+            Check::new(
+                Status::Warn,
+                "ghostty",
+                format!(
+                    "{} is missing, so Cmd+K cannot move the transcript boundary",
+                    integration.display()
+                ),
+            )
+        });
+    }
+
+    let trigger = keybind_value();
+    let configs = ghostty_configs();
+    checks.push(match configs.iter().find_map(|p| std::fs::read_to_string(p).ok().filter(|c| has_keybind(c, &trigger))) {
+        Some(_) => Check::new(Status::Ok, "keybind", format!("a Ghostty keybind sends {trigger}")),
+        None => Check::new(
+            Status::Warn,
+            "keybind",
+            format!("no Ghostty keybind sends {trigger}, so there is no copy shortcut. See the README"),
+        ),
+    });
+    checks
+}
+
+/// The Ghostty action text for the copy trigger, for example `csi:9000~`.
+fn keybind_value() -> String {
+    let tail = COPY_TRIGGER.strip_prefix(b"\x1b[").unwrap_or(COPY_TRIGGER);
+    format!("csi:{}", String::from_utf8_lossy(tail))
+}
+
+fn has_keybind(config: &str, trigger: &str) -> bool {
+    config.lines().any(|line| {
+        let line = line.trim();
+        !line.starts_with('#') && line.starts_with("keybind") && line.contains(trigger)
+    })
+}
+
+fn ghostty_configs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        dirs.push(PathBuf::from(xdg).join("ghostty"));
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        let home = PathBuf::from(home);
+        dirs.push(home.join(".config/ghostty"));
+        dirs.push(home.join("Library/Application Support/com.mitchellh.ghostty"));
+    }
+    dirs.iter()
+        .flat_map(|dir| [dir.join("config"), dir.join("config.ghostty")])
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(status: Status) -> Check {
+        Check::new(status, "x", "detail")
+    }
+
+    #[test]
+    fn render_aligns_columns_and_summarises() {
+        let out = render(&[
+            Check::new(Status::Ok, "binary", "fine"),
+            Check::new(Status::Fail, "zshrc", "missing"),
+        ]);
+        assert_eq!(
+            out,
+            "ok    binary     fine\nFAIL  zshrc      missing\n\n1 problem found.\n"
+        );
+    }
+
+    #[test]
+    fn summary_counts_failures_and_warnings() {
+        let all_good = render(&[check(Status::Ok)]);
+        assert!(all_good.ends_with("Everything looks good.\n"));
+        let warned = render(&[check(Status::Warn), check(Status::Warn)]);
+        assert!(warned.ends_with("No problems, 2 warnings.\n"));
+        let both = render(&[
+            check(Status::Fail),
+            check(Status::Warn),
+            check(Status::Fail),
+        ]);
+        assert!(both.ends_with("2 problems and 1 warning.\n"));
+    }
+
+    #[test]
+    fn only_failures_fail_the_run() {
+        assert!(!has_failure(&[check(Status::Ok), check(Status::Warn)]));
+        assert!(has_failure(&[check(Status::Ok), check(Status::Fail)]));
+    }
+
+    #[test]
+    fn zshrc_check_covers_each_presence() {
+        let path = Path::new("/h/.zshrc");
+        let first = zshrc_check(path, "eval \"$(termscribe init zsh)\"\n");
+        assert_eq!(first.status, Status::Ok);
+        let later = zshrc_check(path, "a\neval \"$(termscribe init zsh)\"\n");
+        assert_eq!(later.status, Status::Warn);
+        assert!(later.detail.contains("line 2"));
+        let missing = zshrc_check(path, "a\n");
+        assert_eq!(missing.status, Status::Fail);
+        assert!(missing.detail.contains("termscribe setup"));
+    }
+
+    #[test]
+    fn keybind_value_matches_the_trigger() {
+        assert_eq!(keybind_value(), "csi:9000~");
+    }
+
+    #[test]
+    fn keybind_search_ignores_comments_and_other_keys() {
+        let trigger = keybind_value();
+        assert!(has_keybind("keybind = super+shift+c=csi:9000~\n", &trigger));
+        assert!(has_keybind(
+            "font-size = 14\n  keybind=a=csi:9000~",
+            &trigger
+        ));
+        assert!(!has_keybind("# keybind = a=csi:9000~\n", &trigger));
+        assert!(!has_keybind("keybind = a=csi:1~\n", &trigger));
+        assert!(!has_keybind("title = csi:9000~\n", &trigger));
+    }
+
+    #[test]
+    fn find_in_path_skips_non_executables() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let plain = dir.path().join("tool");
+        std::fs::write(&plain, "").expect("write");
+        assert!(!is_executable(&plain));
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(is_executable(&plain));
+        assert!(!is_executable(dir.path()));
+    }
+}
