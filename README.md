@@ -27,24 +27,45 @@ cat: missing.txt: No such file or directory
 ```
 ````
 
+## Installation
+
+termscribe supports macOS. Install via Homebrew:
+
+```sh
+brew tap mhmdxsadk/tools
+brew install termscribe
+```
+
 ## Setup
 
-The shell integration goes at the top of `~/.zshrc`. New terminal tabs then run their shell through termscribe.
+### Automatic
+
+```sh
+termscribe setup
+```
+
+This adds `eval "$(termscribe init zsh)"` as the first line of `~/.zshrc`. To undo this, run `termscribe remove`.
+
+### Manual
+
+Open `~/.zshrc` and add this as the first line:
 
 ```sh
 eval "$(termscribe init zsh)"
 ```
 
+Start a new terminal session. `termscribe doctor` checks that everything is in place.
+
 ## Usage
 
 ```sh
-termscribe          # since the session started or the last clear
-termscribe 3        # the last 3 commands
-termscribe --all    # every command the session remembers
-termscribe --clear  # make later copies skip everything so far
+termscribe        # since the session started or the last clear
+termscribe 3      # the last 3 commands
+termscribe all    # every command the session remembers
+termscribe clear  # make later copies skip everything so far
 ```
 
-Other flags are listed in `termscribe --help`.
+Every flag works with or without its dashes, so `termscribe clear` and `termscribe --clear` do the same thing. Other flags are listed in `termscribe --help`.
 
 ## Keyboard shortcut
 
