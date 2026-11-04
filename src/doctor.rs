@@ -214,8 +214,22 @@ fn check_session() -> Check {
             "this shell is not in a termscribe session. Start a new terminal session to test it",
         );
     };
-    match ipc::request(Path::new(&socket), &Request::Ping) {
+    session_check(ipc::request(Path::new(&socket), &Request::Ping))
+}
+
+/// Turns the relay's answer to a ping into a check. A relay that started under an older
+/// termscribe does not know the ping request and answers with an error, so that case gets its own
+/// message instead of a raw one.
+fn session_check(reply: Result<Response, ipc::IpcError>) -> Check {
+    const NAME: &str = "session";
+    match reply {
         Ok(Response::Pong) => Check::new(Status::Ok, NAME, "the relay answers"),
+        Ok(Response::Error(message)) if message.contains("unknown variant") => Check::new(
+            Status::Warn,
+            NAME,
+            "this terminal session started under an older termscribe. \
+             Start a new terminal session to use the current version",
+        ),
         Ok(other) => Check::new(
             Status::Fail,
             NAME,
@@ -363,6 +377,24 @@ mod tests {
         let missing = zshrc_check(path, "a\n");
         assert_eq!(missing.status, Status::Fail);
         assert!(missing.detail.contains("termscribe setup"));
+    }
+
+    #[test]
+    fn session_check_explains_a_relay_from_an_older_version() {
+        let old_relay = Response::Error(
+            "bad request: unknown variant `Ping`, expected `Render` or `Clear`".into(),
+        );
+        let check = session_check(Ok(old_relay));
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check.detail.contains("older termscribe"),
+            "{}",
+            check.detail
+        );
+        assert_eq!(session_check(Ok(Response::Pong)).status, Status::Ok);
+        let other = session_check(Ok(Response::Error("boom".into())));
+        assert_eq!(other.status, Status::Fail);
+        assert_eq!(session_check(Ok(Response::Cleared)).status, Status::Fail);
     }
 
     #[test]
