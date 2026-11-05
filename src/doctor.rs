@@ -5,9 +5,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::dotfile;
+use crate::ghostty;
 use crate::input::COPY_TRIGGER;
 use crate::ipc::{self, Request, Response, SOCKET_ENV};
-use crate::zshrc::{self, Presence};
+use crate::zshrc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -35,7 +37,9 @@ impl Check {
 
 /// Runs every check against the current environment.
 pub fn run() -> Vec<Check> {
-    let mut checks = vec![check_binary(), check_zsh(), check_zshrc(), check_session()];
+    let mut checks = vec![check_binary(), check_zsh(), check_launch()];
+    checks.extend(check_old_zshrc_line());
+    checks.push(check_session());
     checks.push(check_clipboard());
     checks.extend(check_ghostty());
     checks
@@ -89,6 +93,7 @@ fn plural(count: usize, noun: &str) -> String {
 pub fn find_in_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(name))
         .find(|candidate| is_executable(candidate))
 }
@@ -162,40 +167,81 @@ fn check_zsh() -> Check {
     }
 }
 
-fn check_zshrc() -> Check {
-    const NAME: &str = "zshrc";
-    let path = match zshrc::zshrc_path() {
-        Ok(path) => path,
-        Err(error) => return Check::new(Status::Fail, NAME, error.to_string()),
-    };
-    match zshrc::read(&path) {
-        Ok(content) => zshrc_check(&path, &content),
-        Err(error) => Check::new(Status::Fail, NAME, format!("{error:#}")),
+/// The command Ghostty is configured to run, and the file it comes from. Ghostty reads its
+/// config files in order and the last `command` line wins.
+fn ghostty_command() -> Option<(PathBuf, String)> {
+    let mut found = None;
+    for path in ghostty::config_paths() {
+        if let Ok(content) = dotfile::read(&path) {
+            if let Some(command) = ghostty::effective_command(&content) {
+                found = Some((path, command.to_string()));
+            }
+        }
+    }
+    found
+}
+
+fn check_launch() -> Check {
+    let in_session = std::env::var_os(SOCKET_ENV).is_some_and(|v| !v.is_empty());
+    launch_check(in_session, ghostty::is_installed(), ghostty_command())
+}
+
+/// Checks that something starts the relay when a terminal opens. A shell that already runs in a
+/// session proves it. Otherwise the answer is in Ghostty's config.
+fn launch_check(
+    in_session: bool,
+    ghostty_present: bool,
+    command: Option<(PathBuf, String)>,
+) -> Check {
+    const NAME: &str = "launch";
+    if in_session {
+        return Check::new(Status::Ok, NAME, "this terminal started termscribe relay");
+    }
+    match command {
+        Some((path, command)) if ghostty::is_relay_command(&command) => Check::new(
+            Status::Ok,
+            NAME,
+            format!("Ghostty runs `{command}` ({})", path.display()),
+        ),
+        Some((path, command)) => Check::new(
+            Status::Fail,
+            NAME,
+            format!(
+                "Ghostty runs `{command}` ({}), not termscribe. Run `termscribe setup`",
+                path.display()
+            ),
+        ),
+        None if ghostty_present => Check::new(
+            Status::Fail,
+            NAME,
+            "Ghostty does not start termscribe. Run `termscribe setup`",
+        ),
+        None => Check::new(
+            Status::Warn,
+            NAME,
+            "cannot tell if your terminal runs `termscribe relay`. Check its settings",
+        ),
     }
 }
 
-fn zshrc_check(path: &Path, content: &str) -> Check {
-    const NAME: &str = "zshrc";
-    let shown = path.display();
-    match zshrc::inspect(content) {
-        Presence::First => Check::new(
-            Status::Ok,
-            NAME,
-            format!("{shown} starts with the termscribe init line"),
+fn check_old_zshrc_line() -> Option<Check> {
+    let path = zshrc::zshrc_path().ok()?;
+    let content = dotfile::read(&path).ok()?;
+    old_zshrc_line_check(&path, &content)
+}
+
+/// Reports the line that termscribe 0.1.0 added to `.zshrc`, which is no longer needed.
+fn old_zshrc_line_check(path: &Path, content: &str) -> Option<Check> {
+    let line = zshrc::find_init_line(content)?;
+    Some(Check::new(
+        Status::Warn,
+        "zshrc",
+        format!(
+            "line {line} of {} is from termscribe 0.1.0 and is not needed any more. \
+             `termscribe setup` removes it",
+            path.display()
         ),
-        Presence::Later(line) => Check::new(
-            Status::Warn,
-            NAME,
-            format!(
-                "the termscribe init line is on line {line} of {shown}. `termscribe setup` moves it to line 1"
-            ),
-        ),
-        Presence::Missing => Check::new(
-            Status::Fail,
-            NAME,
-            format!("the termscribe init line is not in {shown}. Run `termscribe setup`"),
-        ),
-    }
+    ))
 }
 
 fn check_session() -> Check {
@@ -286,7 +332,7 @@ fn check_ghostty() -> Vec<Check> {
     }
 
     let trigger = keybind_value();
-    let configs = ghostty_configs();
+    let configs = ghostty::config_paths();
     checks.push(match configs.iter().find_map(|p| std::fs::read_to_string(p).ok().filter(|c| has_keybind(c, &trigger))) {
         Some(_) => Check::new(Status::Ok, "keybind", format!("a Ghostty keybind sends {trigger}")),
         None => Check::new(
@@ -309,21 +355,6 @@ fn has_keybind(config: &str, trigger: &str) -> bool {
         let line = line.trim();
         !line.starts_with('#') && line.starts_with("keybind") && line.contains(trigger)
     })
-}
-
-fn ghostty_configs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        dirs.push(PathBuf::from(xdg).join("ghostty"));
-    }
-    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
-        let home = PathBuf::from(home);
-        dirs.push(home.join(".config/ghostty"));
-        dirs.push(home.join("Library/Application Support/com.mitchellh.ghostty"));
-    }
-    dirs.iter()
-        .flat_map(|dir| [dir.join("config"), dir.join("config.ghostty")])
-        .collect()
 }
 
 #[cfg(test)]
@@ -367,16 +398,51 @@ mod tests {
     }
 
     #[test]
-    fn zshrc_check_covers_each_presence() {
+    fn launch_check_trusts_a_running_session() {
+        let check = launch_check(true, false, None);
+        assert_eq!(check.status, Status::Ok);
+    }
+
+    #[test]
+    fn launch_check_reads_ghostty_s_command() {
+        let path = PathBuf::from("/h/ghostty/config");
+        let relay = launch_check(
+            false,
+            true,
+            Some((path.clone(), "/opt/homebrew/bin/termscribe relay".into())),
+        );
+        assert_eq!(relay.status, Status::Ok);
+        let other = launch_check(false, true, Some((path, "/bin/fish".into())));
+        assert_eq!(other.status, Status::Fail);
+        assert!(
+            other.detail.contains("termscribe setup"),
+            "{}",
+            other.detail
+        );
+        let unset = launch_check(false, true, None);
+        assert_eq!(unset.status, Status::Fail);
+        assert!(
+            unset.detail.contains("termscribe setup"),
+            "{}",
+            unset.detail
+        );
+        let elsewhere = launch_check(false, false, None);
+        assert_eq!(elsewhere.status, Status::Warn);
+    }
+
+    #[test]
+    fn the_old_zshrc_line_is_reported_only_when_present() {
         let path = Path::new("/h/.zshrc");
-        let first = zshrc_check(path, "eval \"$(termscribe init zsh)\"\n");
-        assert_eq!(first.status, Status::Ok);
-        let later = zshrc_check(path, "a\neval \"$(termscribe init zsh)\"\n");
-        assert_eq!(later.status, Status::Warn);
-        assert!(later.detail.contains("line 2"));
-        let missing = zshrc_check(path, "a\n");
-        assert_eq!(missing.status, Status::Fail);
-        assert!(missing.detail.contains("termscribe setup"));
+        assert!(old_zshrc_line_check(path, "export A=1\n").is_none());
+        let check =
+            old_zshrc_line_check(path, "a\neval \"$(termscribe init zsh)\"\n").expect("reported");
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("line 2"), "{}", check.detail);
+        assert!(
+            check.detail.contains("termscribe setup"),
+            "{}",
+            check.detail
+        );
     }
 
     #[test]

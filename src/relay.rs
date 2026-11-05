@@ -5,7 +5,7 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,6 +26,7 @@ use crate::input::{COPY_TRIGGER, InputFilter, InputItem};
 use crate::ipc::{self, SOCKET_ENV, SharedStore};
 use crate::marks::{Item, Mark, MarkScanner};
 use crate::screen::ClearDetector;
+use crate::shell::{BIN_ENV, USER_ZDOTDIR_ENV, write_shim};
 use crate::store::{Limits, ShellState, Store};
 use crate::transcript::Selection;
 
@@ -46,14 +47,25 @@ mod ioctls {
 
 /// Runs a relay around `shell` and returns the exit code for the process.
 ///
-/// If the relay cannot start, this replaces the process with a plain shell instead, so a
-/// problem here never leaves the user without a shell.
+/// The terminal starts this instead of a shell, so the process is a login shell's stand-in. If
+/// the relay cannot start, or the shell is not one termscribe supports, this replaces the process
+/// with a plain login shell instead, so a problem here never leaves the user without a shell.
 pub fn run(shell: Option<String>) -> i32 {
     let shell = shell
         .or_else(|| std::env::var("TERMSCRIBE_SHELL").ok())
         .or_else(|| std::env::var("SHELL").ok())
         .filter(|shell| !shell.is_empty())
         .unwrap_or_else(|| "/bin/zsh".to_string());
+    if std::env::var_os("TERMSCRIBE_DISABLED").is_some_and(|value| !value.is_empty()) {
+        return exec_plain_shell(&shell);
+    }
+    if shell_name(&shell) != "zsh" {
+        eprintln!(
+            "termscribe: only zsh is supported, and your shell is {shell}. \
+             Starting it without termscribe."
+        );
+        return exec_plain_shell(&shell);
+    }
     match Relay::start(&shell) {
         Ok(relay) => match relay.run() {
             Ok(code) => code,
@@ -64,11 +76,29 @@ pub fn run(shell: Option<String>) -> i32 {
         },
         Err(error) => {
             eprintln!("termscribe: {error:#}. Starting a plain shell instead.");
-            let error = Command::new(&shell).env("TERMSCRIBE_DISABLED", "1").exec();
-            eprintln!("termscribe: could not start {shell}: {error}");
-            127
+            exec_plain_shell(&shell)
         }
     }
+}
+
+fn shell_name(shell: &str) -> &str {
+    Path::new(shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(shell)
+}
+
+/// A shell's name with a leading dash tells it to behave as a login shell.
+fn login_name(shell: &str) -> String {
+    format!("-{}", shell_name(shell))
+}
+
+/// Replaces this process with the shell, as the terminal would have started it. Returns only
+/// when that fails.
+fn exec_plain_shell(shell: &str) -> i32 {
+    let error = Command::new(shell).arg0(login_name(shell)).exec();
+    eprintln!("termscribe: could not start {shell}: {error}");
+    127
 }
 
 /// Puts the terminal in raw mode and restores it when dropped.
@@ -138,6 +168,7 @@ struct Relay {
     store: SharedStore,
     clipboard: Arc<dyn Clipboard>,
     socket_path: PathBuf,
+    shim_dir: PathBuf,
     signals: Signals,
     scanner: MarkScanner,
     filter: InputFilter,
@@ -163,6 +194,11 @@ impl Relay {
             .context("could not make the pty nonblocking")?;
 
         let (listener, socket_path) = ipc::bind_socket().context("could not create the socket")?;
+        if let Some(dir) = socket_path.parent() {
+            ipc::remove_stale(dir);
+        }
+        let shim_dir = socket_path.with_extension("zdot");
+        write_shim(&shim_dir).context("could not write the shell startup files")?;
         let store: SharedStore = Arc::new(Mutex::new(Store::new(Limits::default())));
         thread::spawn({
             let store = Arc::clone(&store);
@@ -173,12 +209,19 @@ impl Relay {
 
         let mut command = Command::new(shell);
         command
+            .arg0(login_name(shell))
             .stdin(Stdio::from(pty.slave.try_clone()?))
             .stdout(Stdio::from(pty.slave.try_clone()?))
             .stderr(Stdio::from(pty.slave))
             .env(SOCKET_ENV, &socket_path)
-            .env_remove("TERMSCRIBE_OWNER")
-            .env_remove("TERMSCRIBE_DISABLED");
+            .env("ZDOTDIR", &shim_dir)
+            .env(
+                USER_ZDOTDIR_ENV,
+                std::env::var_os("ZDOTDIR").unwrap_or_default(),
+            );
+        if let Ok(exe) = std::env::current_exe() {
+            command.env(BIN_ENV, exe);
+        }
         // SAFETY: the closure only calls setsid and ioctl, which are async-signal-safe.
         unsafe {
             command.pre_exec(|| {
@@ -201,6 +244,7 @@ impl Relay {
             store,
             clipboard: Arc::from(system_clipboard()),
             socket_path,
+            shim_dir,
             signals,
             scanner: MarkScanner::new(),
             filter: InputFilter::new(),
@@ -222,6 +266,7 @@ impl Relay {
             }
         };
         let _ = std::fs::remove_file(&self.socket_path);
+        let _ = std::fs::remove_dir_all(&self.shim_dir);
         result?;
         Ok(status
             .code()

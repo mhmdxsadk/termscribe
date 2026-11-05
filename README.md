@@ -38,23 +38,27 @@ brew install termscribe
 
 ## Setup
 
+termscribe works by starting your shell for you, so the terminal has to start termscribe instead of the shell. Your `~/.zshrc` stays as it is.
+
 ### Automatic
 
 ```sh
 termscribe setup
 ```
 
-This adds `eval "$(termscribe init zsh)"` as the first line of `~/.zshrc`. To undo this, run `termscribe remove`.
+This adds `command = /opt/homebrew/bin/termscribe relay` to your Ghostty config. Reload the config with Cmd+Shift+, and open a new tab. To undo this, run `termscribe remove`.
 
 ### Manual
 
-Open `~/.zshrc` and add this as the first line:
+Add this line to your Ghostty config, usually `~/.config/ghostty/config`:
 
-```sh
-eval "$(termscribe init zsh)"
+```
+command = /opt/homebrew/bin/termscribe relay
 ```
 
-Start a new terminal session. `termscribe doctor` checks that everything is in place.
+Other terminals have a setting for the program to run in place of the shell. Set it to `/opt/homebrew/bin/termscribe relay`. Run `which termscribe` if your copy is somewhere else.
+
+Reload the config and open a new tab. `termscribe doctor` checks that everything is in place.
 
 ## Usage
 

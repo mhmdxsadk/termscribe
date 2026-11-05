@@ -21,7 +21,7 @@ The text a Command printed to the terminal, as the user saw it. Standard output 
 _Avoid_: Result, stdout
 
 **Relay**:
-The termscribe process that stands between a terminal pane and its shell for one Session and keeps that Session's Command Records.
+The termscribe process that stands between a terminal pane and its shell for one Session and keeps that Session's Command Records. The terminal starts it with `termscribe relay` in place of the shell.
 _Avoid_: Proxy, wrapper, daemon
 
 **Transcript**:

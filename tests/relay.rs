@@ -17,6 +17,7 @@ const WAIT: Duration = Duration::from_secs(15);
 
 struct Session {
     _home: tempfile::TempDir,
+    home: PathBuf,
     clipboard_file: PathBuf,
     socket: PathBuf,
     output: Arc<Mutex<Vec<u8>>>,
@@ -29,33 +30,29 @@ fn zsh_available() -> bool {
     Path::new("/bin/zsh").exists()
 }
 
-/// How the test starts the session.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Launch {
-    /// Run `termscribe relay` directly.
-    Relay,
-    /// Run a plain interactive zsh and let `.zshrc` start the relay, as a real user would.
-    FromZshrc,
-}
+/// The `.zshrc` a session gets unless a test supplies its own.
+const DEFAULT_ZSHRC: &str = "PROMPT='PROMPT> '\nRPROMPT=\n";
 
 impl Session {
     fn start() -> Self {
-        Self::start_with(Launch::Relay)
+        Self::start_with(&[], &[])
     }
 
-    fn start_with(launch: Launch) -> Self {
-        Self::start_full(launch, &[])
-    }
-
-    fn start_full(launch: Launch, extra_env: &[(&str, &str)]) -> Self {
+    /// Starts `termscribe relay` the way a terminal would, with a fresh home directory. `files`
+    /// are the user's startup files, as paths under the home directory. Without a `.zshrc` among
+    /// them the session gets `DEFAULT_ZSHRC`.
+    fn start_with(files: &[(&str, &str)], extra_env: &[(&str, &str)]) -> Self {
         let home = tempfile::tempdir().expect("temp dir");
         // Resolve symlinks so that HOME, the working directory and zsh's `$PWD` all agree.
         let home_path = home.path().canonicalize().expect("canonical temp dir");
-        std::fs::write(
-            home_path.join(".zshrc"),
-            format!("PROMPT='{PROMPT}'\nRPROMPT=\neval \"$(termscribe init zsh)\"\n"),
-        )
-        .expect("write zshrc");
+        if !files.iter().any(|(name, _)| *name == ".zshrc") {
+            std::fs::write(home_path.join(".zshrc"), DEFAULT_ZSHRC).expect("write zshrc");
+        }
+        for (name, content) in files {
+            let path = home_path.join(name);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("create dirs");
+            std::fs::write(path, content).expect("write startup file");
+        }
         let clipboard_file = home_path.join("clipboard.txt");
 
         let bin = PathBuf::from(env!("CARGO_BIN_EXE_termscribe"));
@@ -74,20 +71,9 @@ impl Session {
                 pixel_height: 0,
             })
             .expect("openpty");
-        let mut command = match launch {
-            Launch::Relay => {
-                let mut command = CommandBuilder::new(&bin);
-                command.arg("relay");
-                command
-            }
-            Launch::FromZshrc => {
-                let mut command = CommandBuilder::new("/bin/zsh");
-                command.arg("-i");
-                command
-            }
-        };
+        let mut command = CommandBuilder::new(&bin);
+        command.arg("relay");
         command.env("SHELL", "/bin/zsh");
-        command.env("ZDOTDIR", &home_path);
         command.env("HOME", &home_path);
         command.env("PWD", &home_path);
         command.cwd(&home_path);
@@ -95,8 +81,10 @@ impl Session {
         command.env("TERM", "xterm-256color");
         command.env("TERMSCRIBE_CLIPBOARD_FILE", &clipboard_file);
         for name in [
+            "ZDOTDIR",
             "TERMSCRIBE_SOCKET",
-            "TERMSCRIBE_OWNER",
+            "TERMSCRIBE_USER_ZDOTDIR",
+            "TERMSCRIBE_BIN",
             "TERMSCRIBE_DISABLED",
             "TERM_PROGRAM",
             "GHOSTTY_RESOURCES_DIR",
@@ -127,6 +115,7 @@ impl Session {
 
         let mut session = Self {
             _home: home,
+            home: home_path,
             clipboard_file,
             socket: PathBuf::new(),
             output,
@@ -494,7 +483,7 @@ fn ghostty_integration_is_loaded_inside_the_relay_and_stays_out_of_transcripts()
         eprintln!("skipping: Ghostty is not installed");
         return;
     }
-    let mut s = Session::start_full(Launch::Relay, &[("GHOSTTY_RESOURCES_DIR", resources)]);
+    let mut s = Session::start_with(&[], &[("GHOSTTY_RESOURCES_DIR", resources)]);
     let shown = s.run("echo ${+_ghostty_state}");
     assert!(
         shown.contains("]133;C\x07"),
@@ -517,24 +506,162 @@ fn doctor_reaches_the_session_and_stays_out_of_the_transcript() {
     s.run("echo one");
     let report = s.run("termscribe doctor");
     assert!(report.contains("ok    session"), "{report}");
+    assert!(report.contains("ok    launch"), "{report}");
     let markdown = s.markdown(Selection::All);
     assert!(!markdown.contains("doctor"), "{markdown}");
     assert!(markdown.contains("$ echo one"), "{markdown}");
 }
 
+/// A startup-file line that records which `ZDOTDIR` the file saw.
+fn traced(stage: &str) -> String {
+    format!(r#"print -r -- "{stage} zd=[${{ZDOTDIR-unset}}]" >> "$HOME/trace""#)
+}
+
+impl Session {
+    fn trace(&self) -> String {
+        std::fs::read_to_string(self.home.join("trace")).unwrap_or_default()
+    }
+}
+
 #[test]
-fn zshrc_line_starts_the_relay_and_hooks() {
+fn the_users_startup_files_run_in_order_and_see_no_shim() {
     require_zsh!();
-    let mut s = Session::start_with(Launch::FromZshrc);
-    s.run("echo via-rc");
-    let markdown = s.markdown(Selection::Last(1));
-    assert_eq!(markdown, "```\n~ $ echo via-rc\nvia-rc\n```\n");
-    // The `ts` shortcut function exists because nothing else uses that name.
-    let shown = s.run("type ts");
+    let rc = format!("{DEFAULT_ZSHRC}{}\n", traced("rc"));
+    let (env, profile, login) = (traced("env"), traced("profile"), traced("login"));
+    let mut s = Session::start_with(
+        &[
+            (".zshenv", &env),
+            (".zprofile", &profile),
+            (".zshrc", &rc),
+            (".zlogin", &login),
+        ],
+        &[],
+    );
+    assert_eq!(
+        s.trace(),
+        "env zd=[unset]\nprofile zd=[unset]\nrc zd=[unset]\nlogin zd=[unset]\n"
+    );
+    // Once the shell is up, ZDOTDIR is the user's own again.
+    let shown = s.run("echo ZD=${ZDOTDIR-unset}");
+    assert!(shown.contains("ZD=unset"), "{shown}");
+    s.run("echo recorded");
+    assert_eq!(
+        s.markdown(Selection::Last(1)),
+        "```\n~ $ echo recorded\nrecorded\n```\n"
+    );
+}
+
+#[test]
+fn a_zdotdir_set_in_zshenv_is_honoured() {
+    require_zsh!();
+    let rc = format!("{DEFAULT_ZSHRC}{}\n", traced("rc"));
+    let profile = traced("profile");
+    let mut s = Session::start_with(
+        &[
+            (".zshenv", "export ZDOTDIR=\"$HOME/.config/zsh\"\n"),
+            (".config/zsh/.zshrc", &rc),
+            (".config/zsh/.zprofile", &profile),
+        ],
+        &[],
+    );
+    let moved = format!("[{}/.config/zsh]", s.home.display());
+    assert_eq!(s.trace(), format!("profile zd={moved}\nrc zd={moved}\n"));
+    let shown = s.run("echo ZD=$ZDOTDIR");
     assert!(
-        shown.contains("function") || shown.contains("ts is"),
+        shown.contains(&format!("ZD={}/.config/zsh", s.home.display())),
         "{shown}"
     );
+    s.run("echo still-recorded");
+    assert!(
+        s.markdown(Selection::Last(1)).contains("still-recorded"),
+        "commands are recorded"
+    );
+}
+
+#[test]
+fn a_session_works_when_path_does_not_hold_termscribe() {
+    require_zsh!();
+    // The terminal starts the relay by its full path, and nothing in PATH leads to termscribe.
+    let mut s = Session::start_with(&[], &[("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")]);
+    s.run("echo no-path");
+    assert_eq!(
+        s.markdown(Selection::Last(1)),
+        "```\n~ $ echo no-path\nno-path\n```\n"
+    );
+    // The `ts` function runs the binary the relay was started from.
+    let shown = s.run("ts --stdout");
+    assert!(shown.contains("$ echo no-path"), "{shown}");
+}
+
+#[test]
+fn the_hooks_load_after_the_users_zshrc() {
+    require_zsh!();
+    // The user's alias exists before the hooks load, so the hooks leave the name `ts` alone.
+    let rc = format!("{DEFAULT_ZSHRC}alias ts='echo user-ts'\n");
+    let mut s = Session::start_with(&[(".zshrc", &rc)], &[]);
+    let shown = s.run("ts");
+    assert!(shown.contains("user-ts"), "{shown}");
+    let shown = s.run("type ts");
+    assert!(shown.contains("alias"), "{shown}");
+}
+
+#[test]
+fn the_line_that_termscribe_0_1_0_added_to_zshrc_is_harmless_in_a_session() {
+    require_zsh!();
+    let rc = format!("{DEFAULT_ZSHRC}eval \"$(termscribe init zsh)\"\n");
+    let mut s = Session::start_with(&[(".zshrc", &rc)], &[]);
+    s.run("echo after-old-line");
+    assert_eq!(
+        s.markdown(Selection::Last(1)),
+        "```\n~ $ echo after-old-line\nafter-old-line\n```\n"
+    );
+}
+
+#[test]
+fn the_shim_directory_is_removed_when_the_session_ends() {
+    require_zsh!();
+    let mut s = Session::start();
+    let shim = s.socket.with_extension("zdot");
+    assert!(
+        shim.is_dir(),
+        "{} should exist during the session",
+        shim.display()
+    );
+    s.send(b"exit\n");
+    let deadline = Instant::now() + WAIT;
+    while shim.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{} was never removed",
+            shim.display()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!s.socket.exists(), "the socket should be removed too");
+}
+
+#[test]
+fn an_unsupported_shell_starts_plain_with_a_warning() {
+    // `echo` stands in for a shell. The relay must not wrap it, and must say why.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_termscribe"))
+        .args(["relay", "--shell", "/bin/echo"])
+        .env_remove("TERMSCRIBE_DISABLED")
+        .output()
+        .expect("run relay");
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("only zsh is supported"), "{stderr}");
+}
+
+#[test]
+fn disabling_termscribe_starts_the_shell_without_a_relay() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_termscribe"))
+        .args(["relay", "--shell", "/bin/echo"])
+        .env("TERMSCRIBE_DISABLED", "1")
+        .output()
+        .expect("run relay");
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
 }
 
 #[test]

@@ -1,6 +1,6 @@
 # Termscribe design note
 
-Date: 2026-11-02. Status: accepted by the user. First version implemented; see the implementation notes at the end.
+Date: 2026-11-02. Status: accepted by the user. First version implemented; see the implementation notes at the end. Amended 2026-11-05: the terminal now starts the relay instead of a `.zshrc` line (`docs/adr/0002-terminal-starts-the-relay.md`).
 
 ## Goal
 
@@ -71,7 +71,7 @@ Capture (relay + marks) -> CommandRecord -> Transcript (selection)
 - **Store.** In-memory ring of `CommandRecord` (500 commands, 1 MiB of output each, with a `[… N bytes truncated …]` marker). Holds the Boundary.
 - **Socket.** One Unix socket per Session, path in `$TERMSCRIBE_SOCKET`, mode `0600` in a `0700` directory. The relay deletes it on exit.
 - **Keybinding.** Ghostty binds `cmd+shift+c` to send a private sequence. The relay swallows it, builds the Transcript itself, copies it, and prints one confirmation line only if the shell is idle. Ghostty's `csi:` keybind action exists in 1.4.0. The exact binding line is verified during implementation.
-- **CLI.** `termscribe [N] [--all] [--clear] [--stdout] [--quiet] [--no-status] [--no-cwd] [--raw-ansi]` and `termscribe init zsh`. Inside a Session it talks to the relay over the socket. Outside one it exits with an explanatory error.
+- **CLI.** `termscribe [N] [--all] [--clear] [--stdout] [--quiet] [--no-status] [--no-cwd] [--raw-ansi]` and `termscribe setup`, `remove`, `doctor` and `relay`. Inside a Session it talks to the relay over the socket. Outside one it exits with an explanatory error.
 - **Clipboard trait.** `pbcopy` first. Linux and Windows implementations add later without touching the core.
 
 ### Output cleaning
@@ -152,12 +152,13 @@ Details settled while building the first version.
 - **Marks.** `ESC ] 7733 ; ts ; <kind> [; <payload>] BEL`. Kinds are `s;<cwd>;<command>` (start, with `%`, ESC and BEL percent-encoded in both parts, and `;` also in the directory), `x` (start, unrecorded) and `e;<status>` (end, shell at a prompt). The zsh hooks write them to `/dev/tty` with no forks. `preexec` is appended to `preexec_functions` and `precmd` is prepended to `precmd_functions`. The first keeps other hooks' output out of the capture, and the second reads `$?` before anything changes it.
 - **Shortcut.** The terminal sends `CSI 9000 ~`. At a prompt the relay forwards it, and a zle widget runs `termscribe` and shows the reply with `zle -M`, which redraws safely. During a command the relay swallows it and copies on a background thread without printing. A lone ESC is never delayed. A partial sequence waits at most 15 ms.
 - **`PROMPT_SP`.** zsh 5.9 prints `%`, padding spaces, `\r`, a space and `\r` after output, before `precmd`. The Cleaner removes that tail, because otherwise the padding overwrites an unterminated last line.
-- **Nested shells.** The first shell exports `TERMSCRIBE_OWNER=$$`. A shell whose `$$` differs installs no hooks, so its output folds into the outer command. `exec zsh` keeps the PID and keeps recording.
+- **Nested shells.** The hooks load only through the shim, and the shim leaves `ZDOTDIR` as the user's own value, so a shell started inside the session runs the user's files and installs no hooks. Its output folds into the outer command. `exec zsh` also loses the hooks, so it stops recording.
 - **Clearing the screen.** At a prompt, Ghostty erases the display and sends a form feed to the shell (checked in Ghostty's current source, not against 1.4.0). The relay moves the boundary when it sees a form feed on the keyboard stream while the shell is idle. Cmd+K during a running command sends nothing to the shell, so it changes nothing. The `clear` command is found by watching its output for `ESC [ 2 J` or `ESC [ 3 J` outside the alternate screen, and the boundary moves when the command ends.
-- **Ghostty's own integration.** Ghostty loads its zsh integration only into the shell it starts, and the relay replaces that shell. Without it Ghostty never sees OSC 133 prompt marks, `cursorIsAtPrompt` stays false, and Cmd+K sends no form feed. The init script sources `$GHOSTTY_RESOURCES_DIR/shell-integration/zsh/ghostty-integration` inside the relay's shell when that variable is set. Ghostty's marks pass through the relay untouched.
+- **Ghostty's own integration.** Ghostty loads its zsh integration only into the shell it starts, and the relay replaces that shell. Without it Ghostty never sees OSC 133 prompt marks, `cursorIsAtPrompt` stays false, and Cmd+K sends no form feed. The hooks file sources `$GHOSTTY_RESOURCES_DIR/shell-integration/zsh/ghostty-integration` inside the relay's shell when that variable is set. Ghostty's marks pass through the relay untouched.
 - **The `termscribe` command.** Every request from the CLI drops the command that is running, so `ts`, `termscribe --clear` and the shortcut widget never enter a transcript.
 - **Home directory.** The relay shortens the directory with its own `$HOME` when it handles the start mark, so the stored record already holds `~/proj`.
 - **Truncation.** Only the first 1 MiB of a command's output is kept, and the marker reports the dropped bytes. Keeping the tail as well is a possible later change.
-- **Fail open.** The relay execs a plain shell with `TERMSCRIBE_DISABLED=1` when it has no terminal or cannot set up the pty.
+- **Fail open.** The relay execs a plain login shell when it has no terminal, cannot set up the pty or the shim, or the shell is not zsh. It does the same without a warning when `TERMSCRIBE_DISABLED` is set.
+- **Launch.** The terminal runs `termscribe relay`. The relay starts the shell as a login shell (argv0 `-zsh`) with `ZDOTDIR` set to `<pid>.zdot` beside its socket, `TERMSCRIBE_USER_ZDOTDIR` holding the user's own `ZDOTDIR`, and `TERMSCRIBE_BIN` holding the binary's path for the hooks. The shim has one file per startup stage (`.zshenv`, `.zprofile`, `.zshrc`) and a `termscribe.zsh` hooks file. See ADR 0002.
 - **Test hook.** `TERMSCRIBE_CLIPBOARD_FILE` writes the clipboard text to a file. The integration tests use it so they never touch the real clipboard.
 - **Not yet verified.** The Ghostty keybinding `keybind = super+shift+c=csi:9000~` has not been tried in a real Ghostty window.

@@ -10,11 +10,12 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::clipboard::system_clipboard;
 use crate::doctor;
+use crate::ghostty::{self, Change};
 use crate::ipc::{self, Request, Response, SOCKET_ENV};
 use crate::relay;
-use crate::shell::{Shell, init_script};
+use crate::shell::{Shell, legacy_init_script};
 use crate::transcript::Selection;
-use crate::zshrc::{self, Change};
+use crate::zshrc;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -62,26 +63,26 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Add `eval "$(termscribe init zsh)"` as the first line of ~/.zshrc
+    /// Make Ghostty start every new terminal through termscribe
     #[command(long_flag = "setup")]
     Setup,
-    /// Remove `eval "$(termscribe init zsh)"` from ~/.zshrc
+    /// Undo setup
     #[command(long_flag = "remove")]
     Remove,
     /// Check that termscribe is installed and working
     #[command(long_flag = "doctor")]
     Doctor,
-    /// Print the shell integration to evaluate from your shell's startup file
+    /// Run your shell inside termscribe. Set your terminal to run this instead of the shell
+    Relay {
+        /// The shell to run. Defaults to your login shell, which must be zsh
+        #[arg(long)]
+        shell: Option<String>,
+    },
+    /// What termscribe 0.1.0 asked you to evaluate in ~/.zshrc
+    #[command(hide = true)]
     Init {
         #[arg(value_enum)]
         shell: Shell,
-    },
-    /// Run the shell inside a relay. The shell integration calls this
-    #[command(hide = true)]
-    Relay {
-        /// The shell program to run
-        #[arg(long)]
-        shell: Option<String>,
     },
 }
 
@@ -178,7 +179,7 @@ pub fn main() -> ExitCode {
     let cli = parse_cli(std::env::args_os().collect()).unwrap_or_else(|error| error.exit());
     match cli.command {
         Some(Command::Init { shell }) => {
-            print!("{}", init_script(shell));
+            print!("{}", legacy_init_script(shell));
             ExitCode::SUCCESS
         }
         Some(Command::Relay { shell }) => {
@@ -210,47 +211,86 @@ fn finish(result: Result<()>) -> ExitCode {
     }
 }
 
+/// Where the terminal should find this binary. A path the user typed in full wins. Otherwise it
+/// is the first `termscribe` in `PATH`, which stays valid after an upgrade, unlike the binary's
+/// own location inside Homebrew's versioned folder.
+fn program_path() -> Result<PathBuf> {
+    std::env::args_os()
+        .next()
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| doctor::find_in_path("termscribe"))
+        .or_else(|| std::env::current_exe().ok())
+        .context("could not find where termscribe is installed")
+}
+
 fn run_setup() -> Result<()> {
-    let path = zshrc::zshrc_path()?;
-    let shown = path.display();
-    match zshrc::setup(&path)? {
-        Change::Added => println!("Added the termscribe line to the top of {shown}."),
-        Change::Moved => println!("Moved the termscribe line to the top of {shown}."),
-        Change::Unchanged => {
-            println!("{shown} already starts with the termscribe line.");
-            return Ok(());
-        }
-    }
-    if doctor::find_in_path("termscribe").is_none() {
-        eprintln!(
-            "warning: termscribe is not on PATH, so new shells will start without it. \
-             Add its install directory to PATH."
+    let program = program_path()?;
+    let line = ghostty::relay_line(&program)?;
+    if !ghostty::is_installed() {
+        bail!(
+            "Ghostty was not found. In your terminal's settings, run `{} relay` instead of \
+             your shell",
+            program.display()
         );
     }
-    println!("Open a new terminal to start a session.");
+    let config = ghostty::config_to_edit()?;
+    let shown = config.display();
+    let change = ghostty::setup(&config, &line)?;
+    match change {
+        Change::Added => println!("Added `{line}` to {shown}."),
+        Change::Updated => println!("Updated the termscribe command in {shown}."),
+        Change::Unchanged => println!("{shown} already starts termscribe."),
+    }
+    remove_old_zshrc_line()?;
+    if change != Change::Unchanged {
+        println!(
+            "Reload the Ghostty config (Cmd+Shift+,) or restart Ghostty, then open a new tab."
+        );
+    }
     Ok(())
 }
 
 fn run_remove() -> Result<()> {
-    let path = zshrc::zshrc_path()?;
-    let shown = path.display();
-    if zshrc::remove(&path)? == 0 {
-        println!("No termscribe line in {shown}.");
+    let mut removed = 0;
+    for config in ghostty::config_paths() {
+        let count = ghostty::remove(&config)?;
+        if count > 0 {
+            println!("Removed the termscribe command from {}.", config.display());
+        }
+        removed += count;
+    }
+    removed += remove_old_zshrc_line()?;
+    if removed == 0 {
+        println!("termscribe is not set up, so there is nothing to remove.");
     } else {
         println!(
-            "Removed the termscribe line from {shown}. Terminals that are already open keep \
-             their session until you close them."
+            "Terminals that are already open keep their session until you close them. \
+             Reload the Ghostty config (Cmd+Shift+,) to stop new tabs from using termscribe."
         );
     }
     Ok(())
+}
+
+/// Takes out the line that termscribe 0.1.0 added to `~/.zshrc`. Returns how many it removed.
+fn remove_old_zshrc_line() -> Result<usize> {
+    let path = zshrc::zshrc_path()?;
+    let removed = zshrc::remove(&path)?;
+    if removed > 0 {
+        println!(
+            "Removed the old termscribe line from {}. It is not needed any more.",
+            path.display()
+        );
+    }
+    Ok(removed)
 }
 
 fn session_socket() -> Result<PathBuf> {
     match std::env::var_os(SOCKET_ENV) {
         Some(path) if !path.is_empty() => Ok(PathBuf::from(path)),
         _ => bail!(
-            "this shell is not running inside a termscribe session. Add \
-             `eval \"$(termscribe init zsh)\"` to the top of ~/.zshrc and open a new terminal"
+            "this shell is not running inside a termscribe session. Run `termscribe setup`, \
+             then open a new terminal tab"
         ),
     }
 }
@@ -364,7 +404,7 @@ mod tests {
             "setup",
             "remove",
             "doctor",
-            "init",
+            "relay",
             "N",
         ] {
             assert!(listed(name), "{name} missing:\n{help}");
@@ -374,7 +414,7 @@ mod tests {
                 .all(|line| !line.trim_start().starts_with("--")),
             "{help}"
         );
-        assert!(!help.contains("relay"), "{help}");
+        assert!(!help.contains("init"), "{help}");
     }
 
     #[test]

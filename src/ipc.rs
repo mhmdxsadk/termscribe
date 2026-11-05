@@ -175,6 +175,39 @@ pub fn bind_socket() -> io::Result<(UnixListener, PathBuf)> {
     Ok((listener, path))
 }
 
+/// Removes the sockets and shim directories that sessions left behind when they died without
+/// cleaning up. A session's files are named after its process id, as `<pid>.sock` and
+/// `<pid>.zdot`. Files whose process still runs are kept.
+pub fn remove_stale(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some((stem, extension)) = name.to_str().and_then(|n| n.rsplit_once('.')) else {
+            continue;
+        };
+        if !matches!(extension, "sock" | "zdot") {
+            continue;
+        }
+        let Ok(pid) = stem.parse::<i32>() else {
+            continue;
+        };
+        let gone = matches!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+        if gone {
+            let path = entry.path();
+            let _ = if path.is_dir() {
+                fs::remove_dir_all(&path)
+            } else {
+                fs::remove_file(&path)
+            };
+        }
+    }
+}
+
 fn runtime_base() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -305,6 +338,30 @@ mod tests {
             serde_json::from_str::<Response>(&line),
             Ok(Response::Error(_))
         ));
+    }
+
+    #[test]
+    fn stale_session_files_are_removed_and_live_ones_kept() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let live = std::process::id();
+        // No process has this id: it is above the largest id macOS and Linux hand out.
+        let dead = 2_000_000_000u32;
+        for name in [
+            format!("{dead}.sock"),
+            format!("{live}.sock"),
+            "notes.txt".into(),
+        ] {
+            fs::write(dir.path().join(name), "").expect("seed file");
+        }
+        for name in [format!("{dead}.zdot"), format!("{live}.zdot")] {
+            fs::create_dir(dir.path().join(name)).expect("seed dir");
+        }
+        remove_stale(dir.path());
+        assert!(!dir.path().join(format!("{dead}.sock")).exists());
+        assert!(!dir.path().join(format!("{dead}.zdot")).exists());
+        assert!(dir.path().join(format!("{live}.sock")).exists());
+        assert!(dir.path().join(format!("{live}.zdot")).exists());
+        assert!(dir.path().join("notes.txt").exists());
     }
 
     #[test]
