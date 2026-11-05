@@ -7,7 +7,6 @@ use std::process::Command;
 
 use crate::dotfile;
 use crate::ghostty;
-use crate::input::COPY_TRIGGER;
 use crate::ipc::{self, Request, Response, SOCKET_ENV};
 use crate::zshrc;
 
@@ -331,23 +330,17 @@ fn check_ghostty() -> Vec<Check> {
         });
     }
 
-    let trigger = keybind_value();
+    let trigger = ghostty::copy_action();
     let configs = ghostty::config_paths();
     checks.push(match configs.iter().find_map(|p| std::fs::read_to_string(p).ok().filter(|c| has_keybind(c, &trigger))) {
         Some(_) => Check::new(Status::Ok, "keybind", format!("a Ghostty keybind sends {trigger}")),
         None => Check::new(
             Status::Warn,
             "keybind",
-            format!("no Ghostty keybind sends {trigger}, so there is no copy shortcut. See the README"),
+            format!("no Ghostty keybind sends {trigger}, so there is no copy shortcut. Run `termscribe setup`"),
         ),
     });
     checks
-}
-
-/// The Ghostty action text for the copy trigger, for example `csi:9000~`.
-fn keybind_value() -> String {
-    let tail = COPY_TRIGGER.strip_prefix(b"\x1b[").unwrap_or(COPY_TRIGGER);
-    format!("csi:{}", String::from_utf8_lossy(tail))
 }
 
 fn has_keybind(config: &str, trigger: &str) -> bool {
@@ -464,13 +457,8 @@ mod tests {
     }
 
     #[test]
-    fn keybind_value_matches_the_trigger() {
-        assert_eq!(keybind_value(), "csi:9000~");
-    }
-
-    #[test]
     fn keybind_search_ignores_comments_and_other_keys() {
-        let trigger = keybind_value();
+        let trigger = ghostty::copy_action();
         assert!(has_keybind("keybind = super+shift+c=csi:9000~\n", &trigger));
         assert!(has_keybind(
             "font-size = 14\n  keybind=a=csi:9000~",

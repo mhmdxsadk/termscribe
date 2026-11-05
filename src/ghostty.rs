@@ -6,14 +6,56 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::dotfile;
+use crate::input::COPY_TRIGGER;
 use crate::shell::shell_word;
 
-/// What `setup` did to the config.
+/// The key that `setup` binds to the copy shortcut.
+const KEYBIND_TRIGGER: &str = "super+alt+c";
+/// A comment `setup` writes above the keybind it adds. `remove` takes out only a keybind that
+/// carries it, so a keybind the user wrote themselves stays.
+const KEYBIND_MARKER: &str = "# termscribe: copy shortcut";
+
+/// What `setup` did to the `command` line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Change {
     Added,
     Updated,
     Unchanged,
+}
+
+/// What `setup` did about the copy shortcut.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeybindChange {
+    Added,
+    /// Some key already sends the copy sequence.
+    Unchanged,
+    /// The key is bound to another action, which `setup` left alone. Holds that action.
+    Taken(String),
+}
+
+/// What `setup` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupResult {
+    pub command: Change,
+    pub keybind: KeybindChange,
+}
+
+/// How many lines `remove` took out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoveResult {
+    pub command: usize,
+    pub keybind: usize,
+}
+
+/// The keybind action that sends the copy sequence, for example `csi:9000~`.
+pub fn copy_action() -> String {
+    let tail = COPY_TRIGGER.strip_prefix(b"\x1b[").unwrap_or(COPY_TRIGGER);
+    format!("csi:{}", String::from_utf8_lossy(tail))
+}
+
+/// The line that binds the copy shortcut.
+pub fn keybind_line() -> String {
+    format!("keybind = {KEYBIND_TRIGGER}={}", copy_action())
 }
 
 /// Every place Ghostty reads its config from, in the order it reads them.
@@ -151,23 +193,104 @@ pub fn without_relay_command(content: &str) -> (String, usize) {
     (kept, removed)
 }
 
-/// Makes Ghostty run the relay. Creates the config when it is missing.
-pub fn setup(path: &Path, line: &str) -> Result<Change> {
-    let (content, change) = with_relay_command(&dotfile::read(path)?, line)?;
-    if change != Change::Unchanged {
-        dotfile::write(path, &content)?;
+/// Splits a `keybind = <trigger>=<action>` line. Comments and other keys give `None`.
+fn keybind_parts(line: &str) -> Option<(&str, &str)> {
+    let line = line.trim();
+    if line.starts_with('#') {
+        return None;
     }
-    Ok(change)
+    let (key, value) = line.split_once('=')?;
+    if key.trim() != "keybind" {
+        return None;
+    }
+    let (trigger, action) = value.trim().split_once('=')?;
+    Some((trigger.trim(), action.trim()))
 }
 
-/// Removes the relay command from the config. Returns how many lines were removed. A missing
-/// file is not created.
-pub fn remove(path: &Path) -> Result<usize> {
-    let (content, removed) = without_relay_command(&dotfile::read(path)?);
-    if removed > 0 {
+/// A trigger without Ghostty's prefixes such as `global:` and `unconsumed:`.
+fn bare_trigger(mut trigger: &str) -> &str {
+    while let Some(rest) = ["all:", "global:", "unconsumed:", "performable:"]
+        .iter()
+        .find_map(|prefix| trigger.strip_prefix(prefix))
+    {
+        trigger = rest;
+    }
+    trigger
+}
+
+/// Returns the config with the copy shortcut bound. Nothing changes when some key already sends
+/// the copy sequence, or when `super+alt+c` already does something else.
+pub fn with_keybind(content: &str) -> (String, KeybindChange) {
+    let action = copy_action();
+    let mut taken = None;
+    for line in content.lines() {
+        let Some((trigger, bound)) = keybind_parts(line) else {
+            continue;
+        };
+        if bound == action {
+            return (content.to_string(), KeybindChange::Unchanged);
+        }
+        if bare_trigger(trigger) == KEYBIND_TRIGGER {
+            taken = Some(bound.to_string());
+        }
+    }
+    if let Some(bound) = taken {
+        return (content.to_string(), KeybindChange::Taken(bound));
+    }
+    let mut out = content.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!("{KEYBIND_MARKER}\n{}\n", keybind_line()));
+    (out, KeybindChange::Added)
+}
+
+/// Returns the config without a keybind that `setup` added, and how many were dropped.
+pub fn without_marked_keybind(content: &str) -> (String, usize) {
+    let action = copy_action();
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let mut kept = String::new();
+    let mut removed = 0;
+    let mut index = 0;
+    while index < lines.len() {
+        let marked = lines[index].trim() == KEYBIND_MARKER
+            && lines
+                .get(index + 1)
+                .and_then(|next| keybind_parts(next))
+                .is_some_and(|(_, bound)| bound == action);
+        if marked {
+            removed += 1;
+            index += 2;
+        } else {
+            kept.push_str(lines[index]);
+            index += 1;
+        }
+    }
+    (kept, removed)
+}
+
+/// Makes Ghostty run the relay and binds the copy shortcut. Creates the config when it is
+/// missing.
+pub fn setup(path: &Path, line: &str) -> Result<SetupResult> {
+    let original = dotfile::read(path)?;
+    let (content, command) = with_relay_command(&original, line)?;
+    let (content, keybind) = with_keybind(&content);
+    if content != original {
         dotfile::write(path, &content)?;
     }
-    Ok(removed)
+    Ok(SetupResult { command, keybind })
+}
+
+/// Removes the relay command and the keybind that `setup` added. A keybind the user wrote
+/// themselves stays. A missing file is not created.
+pub fn remove(path: &Path) -> Result<RemoveResult> {
+    let original = dotfile::read(path)?;
+    let (content, command) = without_relay_command(&original);
+    let (content, keybind) = without_marked_keybind(&content);
+    if command + keybind > 0 {
+        dotfile::write(path, &content)?;
+    }
+    Ok(RemoveResult { command, keybind })
 }
 
 #[cfg(test)]
@@ -266,19 +389,114 @@ mod tests {
         assert_eq!(removed, 1);
     }
 
+    const KEYBIND: &str = "keybind = super+alt+c=csi:9000~";
+    const MARKER: &str = "# termscribe: copy shortcut";
+
+    #[test]
+    fn the_copy_action_and_keybind_match_the_trigger() {
+        assert_eq!(copy_action(), "csi:9000~");
+        assert_eq!(keybind_line(), KEYBIND);
+    }
+
+    #[test]
+    fn reads_keybind_lines_and_ignores_the_rest() {
+        assert_eq!(
+            keybind_parts("keybind = super+alt+c=csi:9000~"),
+            Some(("super+alt+c", "csi:9000~"))
+        );
+        assert_eq!(keybind_parts("  keybind=a=text:x"), Some(("a", "text:x")));
+        assert_eq!(keybind_parts("# keybind = a=csi:9000~"), None);
+        assert_eq!(keybind_parts("title = a=b"), None);
+        assert_eq!(keybind_parts("keybind = clear"), None);
+        assert_eq!(bare_trigger("global:unconsumed:super+alt+c"), "super+alt+c");
+    }
+
+    #[test]
+    fn keybind_is_appended_with_a_marker() {
+        let (out, change) = with_keybind("font-size = 14");
+        assert_eq!(out, format!("font-size = 14\n{MARKER}\n{KEYBIND}\n"));
+        assert_eq!(change, KeybindChange::Added);
+        let (out, _) = with_keybind("");
+        assert_eq!(out, format!("{MARKER}\n{KEYBIND}\n"));
+    }
+
+    #[test]
+    fn keybind_is_left_alone_when_any_key_sends_the_sequence() {
+        for original in [
+            format!("{KEYBIND}\n"),
+            "keybind = super+shift+c=csi:9000~\n".to_string(),
+            "keybind = global:f5=csi:9000~\n".to_string(),
+        ] {
+            let (out, change) = with_keybind(&original);
+            assert_eq!(out, original);
+            assert_eq!(change, KeybindChange::Unchanged);
+        }
+    }
+
+    #[test]
+    fn keybind_is_skipped_when_the_key_does_something_else() {
+        let original = "keybind = super+alt+c=text:hello\n";
+        let (out, change) = with_keybind(original);
+        assert_eq!(out, original);
+        assert_eq!(change, KeybindChange::Taken("text:hello".into()));
+    }
+
+    #[test]
+    fn a_commented_out_keybind_does_not_count() {
+        let (_, change) = with_keybind("# keybind = super+alt+c=csi:9000~\n");
+        assert_eq!(change, KeybindChange::Added);
+    }
+
+    #[test]
+    fn removal_takes_only_a_keybind_that_carries_the_marker() {
+        let ours = format!("a = 1\n{MARKER}\n{KEYBIND}\nb = 2\n");
+        let (out, removed) = without_marked_keybind(&ours);
+        assert_eq!(out, "a = 1\nb = 2\n");
+        assert_eq!(removed, 1);
+        let theirs = format!("a = 1\n{KEYBIND}\n");
+        let (out, removed) = without_marked_keybind(&theirs);
+        assert_eq!(out, theirs);
+        assert_eq!(removed, 0);
+        let stranded = format!("{MARKER}\nfont-size = 14\n");
+        assert_eq!(without_marked_keybind(&stranded).0, stranded);
+    }
+
     #[test]
     fn files_are_created_edited_and_cleaned() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("ghostty/config");
-        assert_eq!(remove(&path).expect("remove"), 0);
+        let nothing = remove(&path).expect("remove");
+        assert_eq!((nothing.command, nothing.keybind), (0, 0));
         assert!(!path.exists());
-        assert_eq!(setup(&path, LINE).expect("setup"), Change::Added);
+
+        let done = setup(&path, LINE).expect("setup");
+        assert_eq!(done.command, Change::Added);
+        assert_eq!(done.keybind, KeybindChange::Added);
+        let written = fs::read_to_string(&path).expect("read");
+        assert_eq!(written, format!("{LINE}\n{MARKER}\n{KEYBIND}\n"));
+
+        let again = setup(&path, LINE).expect("setup");
+        assert_eq!(again.command, Change::Unchanged);
+        assert_eq!(again.keybind, KeybindChange::Unchanged);
+        assert_eq!(fs::read_to_string(&path).expect("read"), written);
+
+        let undone = remove(&path).expect("remove");
+        assert_eq!((undone.command, undone.keybind), (1, 1));
+        assert_eq!(fs::read_to_string(&path).expect("read"), "");
+    }
+
+    #[test]
+    fn a_keybind_the_user_wrote_survives_setup_and_remove() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config");
+        fs::write(&path, format!("{KEYBIND}\n")).expect("seed");
+        let done = setup(&path, LINE).expect("setup");
+        assert_eq!(done.keybind, KeybindChange::Unchanged);
+        let undone = remove(&path).expect("remove");
+        assert_eq!((undone.command, undone.keybind), (1, 0));
         assert_eq!(
             fs::read_to_string(&path).expect("read"),
-            format!("{LINE}\n")
+            format!("{KEYBIND}\n")
         );
-        assert_eq!(setup(&path, LINE).expect("setup"), Change::Unchanged);
-        assert_eq!(remove(&path).expect("remove"), 1);
-        assert_eq!(fs::read_to_string(&path).expect("read"), "");
     }
 }

@@ -46,14 +46,15 @@ termscribe works by starting your shell for you, so the terminal has to start te
 termscribe setup
 ```
 
-This adds `command = /opt/homebrew/bin/termscribe relay` to your Ghostty config. Reload the config with Cmd+Shift+, and open a new tab. To undo this, run `termscribe remove`.
+This adds two lines to your Ghostty config. The first makes every new tab start termscribe, and the second makes Cmd+Alt+C copy the transcript. Reload the config with Cmd+Shift+, and open a new tab. To undo this, run `termscribe remove`.
 
 ### Manual
 
-Add this line to your Ghostty config, usually `~/.config/ghostty/config`:
+Add these lines to your Ghostty config, usually `~/.config/ghostty/config`:
 
 ```
 command = /opt/homebrew/bin/termscribe relay
+keybind = super+alt+c=csi:9000~
 ```
 
 Other terminals have a setting for the program to run in place of the shell. Set it to `/opt/homebrew/bin/termscribe relay`. Run `which termscribe` if your copy is somewhere else.
@@ -73,11 +74,7 @@ Every flag works with or without its dashes, so `termscribe clear` and `termscri
 
 ## Keyboard shortcut
 
-If your terminal supports custom shortcuts, any key can trigger a copy by sending `ESC [ 9000 ~`. In [Ghostty](https://ghostty.org), for example:
-
-```
-keybind = super+alt+c=csi:9000~
-```
+Cmd+Alt+C copies the transcript, even while a command is running. In another terminal, bind any key to send `ESC [ 9000 ~`.
 
 ## License
 

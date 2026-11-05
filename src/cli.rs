@@ -10,7 +10,7 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::clipboard::system_clipboard;
 use crate::doctor;
-use crate::ghostty::{self, Change};
+use crate::ghostty::{self, Change, KeybindChange};
 use crate::ipc::{self, Request, Response, SOCKET_ENV};
 use crate::relay;
 use crate::shell::{Shell, legacy_init_script};
@@ -236,14 +236,27 @@ fn run_setup() -> Result<()> {
     }
     let config = ghostty::config_to_edit()?;
     let shown = config.display();
-    let change = ghostty::setup(&config, &line)?;
-    match change {
+    let done = ghostty::setup(&config, &line)?;
+    match done.command {
         Change::Added => println!("Added `{line}` to {shown}."),
         Change::Updated => println!("Updated the termscribe command in {shown}."),
         Change::Unchanged => println!("{shown} already starts termscribe."),
     }
+    match &done.keybind {
+        KeybindChange::Added => println!(
+            "Added `{}` to {shown}, so Cmd+Alt+C copies the transcript.",
+            ghostty::keybind_line()
+        ),
+        KeybindChange::Unchanged => {}
+        KeybindChange::Taken(action) => println!(
+            "Left Cmd+Alt+C alone, because it is already bound to `{action}` in {shown}. \
+             Bind any key to `{}` to copy with a shortcut.",
+            ghostty::copy_action()
+        ),
+    }
     remove_old_zshrc_line()?;
-    if change != Change::Unchanged {
+    let changed = done.command != Change::Unchanged || done.keybind == KeybindChange::Added;
+    if changed {
         println!(
             "Reload the Ghostty config (Cmd+Shift+,) or restart Ghostty, then open a new tab."
         );
@@ -254,11 +267,14 @@ fn run_setup() -> Result<()> {
 fn run_remove() -> Result<()> {
     let mut removed = 0;
     for config in ghostty::config_paths() {
-        let count = ghostty::remove(&config)?;
-        if count > 0 {
+        let done = ghostty::remove(&config)?;
+        if done.command > 0 {
             println!("Removed the termscribe command from {}.", config.display());
         }
-        removed += count;
+        if done.keybind > 0 {
+            println!("Removed the copy shortcut from {}.", config.display());
+        }
+        removed += done.command + done.keybind;
     }
     removed += remove_old_zshrc_line()?;
     if removed == 0 {
