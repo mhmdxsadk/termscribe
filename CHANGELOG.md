@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3](https://github.com/mhmdxsadk/termscribe/compare/v0.2.2...v0.2.3) (2026-11-05)
+
+
+### Bug Fixes
+
+* **setup:** skip the empty line after an empty last line ([dea8bd1](https://github.com/mhmdxsadk/termscribe/commit/dea8bd18c0e2a59d03d6e55bb241a6b8c0b0d497))
+
 ## [0.2.2](https://github.com/mhmdxsadk/termscribe/compare/v0.2.1...v0.2.2) (2026-11-05)
 
 
