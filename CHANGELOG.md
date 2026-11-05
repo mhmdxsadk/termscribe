@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/mhmdxsadk/termscribe/compare/v0.2.0...v0.2.1) (2026-11-05)
+
+
+### Features
+
+* **setup:** bind the copy shortcut in the Ghostty config ([46cac33](https://github.com/mhmdxsadk/termscribe/commit/46cac3314e25abe1f68fc747cc00d9ff6a2b7b4a))
+
 ## [0.2.0](https://github.com/mhmdxsadk/termscribe/compare/v0.1.0...v0.2.0) (2026-11-05)
 
 
