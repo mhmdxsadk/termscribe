@@ -229,11 +229,14 @@ pub fn with_block(content: &str, lines: &[String]) -> String {
     if lines.is_empty() {
         return out;
     }
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    if !out.is_empty() && !out.ends_with("\n\n") {
-        out.push('\n');
+    if !out.is_empty() {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        let last_line_is_empty = out.lines().next_back().is_some_and(|l| l.trim().is_empty());
+        if !last_line_is_empty {
+            out.push('\n');
+        }
     }
     out.push_str(MARKER);
     out.push('\n');
@@ -397,6 +400,17 @@ mod tests {
         let out = with_block("font-size = 14\n\n", &lines);
         assert_eq!(out, format!("font-size = 14\n\n{MARKER}\n{LINE}\n"));
         assert_eq!(with_block("", &lines), format!("{MARKER}\n{LINE}\n"));
+        // A file that is only an empty line, or whose last line is only spaces, already ends
+        // with an empty line.
+        assert_eq!(with_block("\n", &lines), format!("\n{MARKER}\n{LINE}\n"));
+        assert_eq!(
+            with_block("a = 1\n  \n", &lines),
+            format!("a = 1\n  \n{MARKER}\n{LINE}\n")
+        );
+        assert_eq!(
+            with_block("a = 1\n  ", &lines),
+            format!("a = 1\n  \n{MARKER}\n{LINE}\n")
+        );
         assert_eq!(with_block("a = 1\n", &[]), "a = 1\n");
     }
 
