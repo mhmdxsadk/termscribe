@@ -34,8 +34,9 @@ pub fn lock(store: &SharedStore) -> MutexGuard<'_, Store> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
-    /// Render a transcript. The caller is a command running in the session, so the relay forgets
-    /// that command.
+    /// Render a transcript. The caller is a command running in the session. When the transcript
+    /// holds commands, the relay forgets the caller. When it is empty, the caller stays in the
+    /// history.
     Render {
         selection: Selection,
         show_status: bool,
@@ -86,13 +87,17 @@ pub fn handle(store: &SharedStore, request: Request) -> Response {
             show_cwd,
             keep_ansi,
         } => {
-            lock(store).discard_pending();
             let options = FormatOptions {
                 show_status,
                 show_cwd,
                 keep_ansi,
             };
             let (markdown, commands) = render(store, selection, &options);
+            // A call that finds nothing to copy is an ordinary command, so it stays in the
+            // history. Only a call that hands over a transcript is left out of the next one.
+            if commands > 0 {
+                lock(store).discard_pending();
+            }
             Response::Rendered { markdown, commands }
         }
         Request::Clear => {
@@ -268,6 +273,21 @@ mod tests {
         assert_eq!(markdown, "```\n$ a\n1\n```\n");
         lock(&store).finish(Some(0));
         assert_eq!(lock(&store).select(Selection::All).len(), 1);
+    }
+
+    #[test]
+    fn an_empty_render_keeps_the_calling_command() {
+        let store = store_with(&[]);
+        lock(&store).begin(Some("termscribe".into()), None);
+        let Response::Rendered { commands, .. } = handle(&store, render_request(Selection::All))
+        else {
+            panic!("expected a rendered reply");
+        };
+        assert_eq!(commands, 0);
+        lock(&store).finish(Some(0));
+        let kept = lock(&store).select(Selection::All);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept.records[0].command, "termscribe");
     }
 
     #[test]

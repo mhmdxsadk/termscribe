@@ -180,6 +180,16 @@ fn ghostty_command() -> Option<(PathBuf, String)> {
     found
 }
 
+/// True when Ghostty is in use but its config does not start `termscribe relay`, so new tabs
+/// are not captured.
+pub fn ghostty_needs_setup() -> bool {
+    needs_setup(ghostty::is_installed(), ghostty_command())
+}
+
+fn needs_setup(ghostty_present: bool, command: Option<(PathBuf, String)>) -> bool {
+    ghostty_present && !command.is_some_and(|(_, command)| ghostty::is_relay_command(&command))
+}
+
 fn check_launch() -> Check {
     let in_session = std::env::var_os(SOCKET_ENV).is_some_and(|v| !v.is_empty());
     launch_check(in_session, ghostty::is_installed(), ghostty_command())
@@ -356,6 +366,21 @@ mod tests {
 
     fn check(status: Status) -> Check {
         Check::new(status, "x", "detail")
+    }
+
+    #[test]
+    fn setup_is_needed_only_when_ghostty_does_not_start_the_relay() {
+        let relay = || {
+            Some((
+                PathBuf::from("c"),
+                "/opt/homebrew/bin/termscribe relay".into(),
+            ))
+        };
+        let other = || Some((PathBuf::from("c"), "/bin/fish".into()));
+        assert!(needs_setup(true, None));
+        assert!(needs_setup(true, other()));
+        assert!(!needs_setup(true, relay()));
+        assert!(!needs_setup(false, None));
     }
 
     #[test]

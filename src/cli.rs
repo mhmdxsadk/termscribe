@@ -354,7 +354,14 @@ fn run_copy(cli: &Cli) -> Result<()> {
     }
     if commands == 0 {
         if !cli.quiet {
-            println!("No commands to copy.");
+            if doctor::ghostty_needs_setup() {
+                println!(
+                    "termscribe is not set up in Ghostty yet, so new tabs are not captured. \
+                     Run `termscribe setup`."
+                );
+            } else {
+                println!("No commands to copy.");
+            }
         }
         return Ok(());
     }
