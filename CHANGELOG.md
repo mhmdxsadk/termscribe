@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.2](https://github.com/mhmdxsadk/termscribe/compare/v0.2.1...v0.2.2) (2026-11-05)
+
+
+### Features
+
+* **setup:** write one termscribe block to the config ([0b26e0b](https://github.com/mhmdxsadk/termscribe/commit/0b26e0b5791f0de043e7439fa9e5c5f6e41e2004))
+
+
+### Bug Fixes
+
+* **copy:** keep empty calls in the history ([861688b](https://github.com/mhmdxsadk/termscribe/commit/861688b4653712913166d18aee82035448ccf5d1))
+
 ## [0.2.1](https://github.com/mhmdxsadk/termscribe/compare/v0.2.0...v0.2.1) (2026-11-05)
 
 
