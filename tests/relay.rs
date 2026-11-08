@@ -578,6 +578,86 @@ fn a_zdotdir_set_in_zshenv_is_honoured() {
     );
 }
 
+impl Session {
+    /// What `$HISTFILE` is in a plain interactive zsh with this session's home and startup files,
+    /// that is, without termscribe. `None` when zsh sets no history file.
+    fn plain_histfile(&self) -> Option<String> {
+        let output = std::process::Command::new("/bin/zsh")
+            .args(["-i", "-c", "print -r -- HF=$HISTFILE"])
+            .env("HOME", &self.home)
+            .env("TERM", "xterm-256color")
+            .env_remove("ZDOTDIR")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run plain zsh");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let value = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("HF="))?
+            .to_string();
+        (!value.is_empty()).then_some(value)
+    }
+
+    fn histfile(&mut self) -> String {
+        let shown = self.run("print -r -- HF=[$HISTFILE]");
+        let at = shown.rfind("HF=[").expect("HISTFILE in output") + "HF=[".len();
+        shown[at..].chars().take_while(|&c| c != ']').collect()
+    }
+}
+
+#[test]
+fn history_goes_to_the_same_file_as_in_plain_zsh() {
+    require_zsh!();
+    // macOS's /etc/zshrc sets HISTFILE from ZDOTDIR, which the shim owns while it runs.
+    let mut s = Session::start();
+    let Some(expected) = s.plain_histfile() else {
+        eprintln!("skipping: plain zsh sets no HISTFILE here");
+        return;
+    };
+    assert_eq!(s.histfile(), expected);
+    assert!(
+        !expected.contains(".zdot"),
+        "plain zsh must not point into the shim: {expected}"
+    );
+}
+
+#[test]
+fn earlier_history_is_available_in_a_session() {
+    require_zsh!();
+    let mut s = Session::start_with(&[(".zsh_history", "echo from-before\n")], &[]);
+    if s.plain_histfile().is_none() {
+        eprintln!("skipping: plain zsh sets no HISTFILE here");
+        return;
+    }
+    let shown = s.run("fc -l 1");
+    assert!(shown.contains("echo from-before"), "{shown}");
+}
+
+#[test]
+fn a_histfile_set_in_zshrc_is_kept() {
+    require_zsh!();
+    let rc = format!("{DEFAULT_ZSHRC}HISTFILE=\"$HOME/mine\"\n");
+    let mut s = Session::start_with(&[(".zshrc", &rc)], &[]);
+    assert_eq!(s.histfile(), format!("{}/mine", s.home.display()));
+}
+
+#[test]
+fn history_follows_a_zdotdir_set_in_zshenv() {
+    require_zsh!();
+    let mut s = Session::start_with(
+        &[
+            (".zshenv", "export ZDOTDIR=\"$HOME/.config/zsh\"\n"),
+            (".config/zsh/.zshrc", DEFAULT_ZSHRC),
+        ],
+        &[],
+    );
+    let Some(expected) = s.plain_histfile() else {
+        eprintln!("skipping: plain zsh sets no HISTFILE here");
+        return;
+    };
+    assert_eq!(s.histfile(), expected);
+}
+
 #[test]
 fn a_session_works_when_path_does_not_hold_termscribe() {
     require_zsh!();

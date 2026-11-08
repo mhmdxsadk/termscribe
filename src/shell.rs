@@ -144,6 +144,12 @@ if [[ -n $TERMSCRIBE_USER_ZDOTDIR ]]; then
 else
   unset ZDOTDIR
 fi
+# zsh read /etc/zshrc while ZDOTDIR was the shim directory. On macOS that file sets HISTFILE from
+# ZDOTDIR, so the history would be read from and saved to a directory that is deleted when the
+# session ends. Point it at the place a shell without termscribe would use.
+if [[ $HISTFILE == "$_termscribe_shim_dir"/* ]]; then
+  HISTFILE=${ZDOTDIR:-$HOME}/${HISTFILE#"$_termscribe_shim_dir"/}
+fi
 [[ -r ${ZDOTDIR:-$HOME}/.zshrc ]] && source "${ZDOTDIR:-$HOME}/.zshrc"
 # From here on ZDOTDIR is yours again, so zsh reads your .zlogin and .zlogout from your own
 # directory and any shell you start inside this one ignores the shim.
