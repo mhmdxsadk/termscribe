@@ -53,7 +53,9 @@ This adds two lines to your Ghostty config. The first makes every new tab start 
 Add these lines to your Ghostty config, usually `~/.config/ghostty/config`:
 
 ```
+# Run termscribe on top of the default shell when creating a new session
 command = /opt/homebrew/bin/termscribe relay
+# Bind Cmd+Alt+C to copy the transcript
 keybind = super+alt+c=csi:9000~
 ```
 
@@ -72,9 +74,7 @@ termscribe clear  # make later copies skip everything so far
 
 Every flag works with or without its dashes, so `termscribe clear` and `termscribe --clear` do the same thing. Other flags are listed in `termscribe --help`.
 
-## Keyboard shortcut
-
-Cmd+Alt+C copies the transcript, even while a command is running. In another terminal, bind any key to send `ESC [ 9000 ~`.
+Cmd+Alt+C copies the transcript too, the same as a bare `termscribe`.
 
 ## License
 
