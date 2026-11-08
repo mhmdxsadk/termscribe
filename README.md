@@ -27,6 +27,10 @@ cat: missing.txt: No such file or directory
 ```
 ````
 
+## How it works
+
+Your terminal starts `termscribe relay` instead of your shell. The relay runs zsh on a pseudo-terminal and passes everything through unchanged, while small zsh hooks tell it where each command starts and ends. It keeps the commands and their output in memory, one history per tab, and drops them when the tab closes. Your zsh history is separate from that and works as usual: it uses your own history file, shared with any zsh running outside termscribe. When you run `termscribe`, it asks the relay for the recent commands, cleans up the output and copies it as Markdown.
+
 ## Installation
 
 termscribe supports macOS. Install via Homebrew:
