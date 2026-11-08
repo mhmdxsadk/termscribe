@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/mhmdxsadk/termscribe/compare/v0.2.3...v0.3.0) (2026-11-08)
+
+
+### Bug Fixes
+
+* **shell:** keep zsh history in the user's own HISTFILE ([12921da](https://github.com/mhmdxsadk/termscribe/commit/12921dabecbee88259ab61557973cf4c6a074d27))
+
 ## [0.2.3](https://github.com/mhmdxsadk/termscribe/compare/v0.2.2...v0.2.3) (2026-11-05)
 
 
