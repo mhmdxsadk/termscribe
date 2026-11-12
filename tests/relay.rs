@@ -296,6 +296,99 @@ fn failed_and_interrupted_commands_show_their_status() {
 }
 
 #[test]
+fn a_line_zsh_rejects_is_recorded_with_its_error() {
+    require_zsh!();
+    let mut s = Session::start();
+    s.run("cd /");
+    s.run("export TOKEN=<TOKEN from file>");
+    s.run("true");
+    let markdown = s.markdown(Selection::Last(3));
+    let expected = "\
+```
+~ $ cd /
+/ $ export TOKEN=<TOKEN from file>
+zsh: parse error near `\\n'
+[exit 1]
+$ true
+```
+";
+    assert_eq!(markdown, expected);
+}
+
+#[test]
+fn a_rejected_line_typed_key_by_key_is_recorded_the_same_way() {
+    require_zsh!();
+    let mut s = Session::start();
+    let start = s.len();
+    for key in "export TOKEN=<TOKEN from file>".bytes() {
+        s.send(&[key]);
+        thread::sleep(Duration::from_millis(3));
+    }
+    s.send(b"\r");
+    s.wait_for_text(PROMPT, start + 40);
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        s.markdown(Selection::Last(1)),
+        "```\n~ $ export TOKEN=<TOKEN from file>\nzsh: parse error near `\\n'\n[exit 1]\n```\n"
+    );
+}
+
+#[test]
+fn a_rejected_line_with_a_leading_space_stays_out_when_histignorespace_is_set() {
+    require_zsh!();
+    let mut s = Session::start_with(
+        &[(
+            ".zshrc",
+            "PROMPT='PROMPT> '\nRPROMPT=\nsetopt histignorespace\n",
+        )],
+        &[],
+    );
+    s.run(" echo )");
+    s.run("true");
+    let markdown = s.markdown(Selection::Last(2));
+    assert!(markdown.ends_with("$ true\n```\n"), "{markdown}");
+    assert!(!markdown.contains("echo )"), "{markdown}");
+    assert!(!markdown.contains("parse error"), "{markdown}");
+}
+
+#[test]
+fn lines_that_print_nothing_and_run_nothing_are_not_recorded() {
+    require_zsh!();
+    let mut s = Session::start_with(
+        &[(
+            ".zshrc",
+            "PROMPT='PROMPT> '\nRPROMPT=\nsetopt interactive_comments\n",
+        )],
+        &[],
+    );
+    s.run("# only a comment");
+    s.run("");
+    s.run("true");
+    let markdown = s.markdown(Selection::Last(2));
+    assert!(markdown.ends_with("$ true\n```\n"), "{markdown}");
+    assert!(!markdown.contains("only a comment"), "{markdown}");
+    assert!(!markdown.contains("[exit"), "{markdown}");
+}
+
+#[test]
+fn a_rejected_line_over_several_lines_keeps_only_the_final_error() {
+    require_zsh!();
+    let mut s = Session::start();
+    let start = s.len();
+    s.send(b"echo 'a\n");
+    s.wait_for_text("quote> ", start);
+    let start = s.len();
+    s.send(b"b' )\n");
+    s.wait_for_text(PROMPT, start);
+    thread::sleep(Duration::from_millis(50));
+    let markdown = s.markdown(Selection::Last(1));
+    assert_eq!(
+        markdown,
+        "```\n~ $ echo 'a\n> b' )\nzsh: parse error near `)'\n[exit 1]\n```\n"
+    );
+}
+
+#[test]
 fn the_working_directory_shows_when_it_changes() {
     require_zsh!();
     let mut s = Session::start();

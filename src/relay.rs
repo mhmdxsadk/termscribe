@@ -20,6 +20,7 @@ use nix::sys::signal::{Signal, kill};
 use nix::sys::termios::{SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
 use nix::unistd::{Pid, isatty, read, write};
 
+use crate::clean::clean;
 use crate::clipboard::{Clipboard, system_clipboard};
 use crate::format::{FormatOptions, abbreviate_home};
 use crate::input::{COPY_TRIGGER, InputFilter, InputItem};
@@ -32,6 +33,8 @@ use crate::transcript::Selection;
 
 /// Ctrl+L. Ghostty sends it to the shell after Cmd+K clears the screen at a prompt.
 const FORM_FEED: u8 = 0x0c;
+/// How much of the output after Enter is kept in case the shell rejects the line.
+const MAX_UNCLAIMED_BYTES: usize = 64 * 1024;
 const READ_SIZE: usize = 64 * 1024;
 /// Stop reading the keyboard while this many bytes wait to be written to the shell.
 const MAX_QUEUED_INPUT: usize = 1024 * 1024;
@@ -162,6 +165,22 @@ impl Signals {
     }
 }
 
+/// What the shell printed for a line it rejected: the visible text after Enter, without the
+/// redraw of the line itself. zsh redraws the line when Enter arrives together with the text
+/// (a paste, or a fast typist), and a prompt may come before it.
+fn rejection_reason(raw: &[u8], command: &str) -> String {
+    let text = clean(raw, false).text;
+    let last_line = command.lines().next_back().unwrap_or("").trim_end();
+    let mut lines = text.lines().skip_while(|line| line.trim().is_empty());
+    let mut rest = lines.clone();
+    if let Some(first) = rest.next() {
+        if !last_line.is_empty() && first.trim_end().ends_with(last_line) {
+            lines = rest;
+        }
+    }
+    lines.collect::<Vec<_>>().join("\n").trim().to_string()
+}
+
 struct Relay {
     master: OwnedFd,
     child: Child,
@@ -173,6 +192,10 @@ struct Relay {
     scanner: MarkScanner,
     filter: InputFilter,
     clear_detector: ClearDetector,
+    /// What the shell printed since the user pressed Enter at a prompt, while no command has
+    /// started. A line that zsh rejects (a syntax error, for instance) never starts a command,
+    /// so this is the only place its error message is seen. `None` when no line is waiting.
+    unclaimed: Option<Vec<u8>>,
     to_child: Vec<u8>,
     stdin_open: bool,
     exit_status: Option<ExitStatus>,
@@ -249,6 +272,7 @@ impl Relay {
             scanner: MarkScanner::new(),
             filter: InputFilter::new(),
             clear_detector: ClearDetector::new(),
+            unclaimed: None,
             to_child: Vec::new(),
             stdin_open: true,
             exit_status: None,
@@ -380,6 +404,12 @@ impl Relay {
             .context("could not write to the terminal")?;
         let mut store = ipc::lock(&self.store);
         store.push_output(data);
+        if store.state() == ShellState::Idle {
+            if let Some(unclaimed) = self.unclaimed.as_mut() {
+                let room = MAX_UNCLAIMED_BYTES.saturating_sub(unclaimed.len());
+                unclaimed.extend_from_slice(&data[..room.min(data.len())]);
+            }
+        }
         if store.state() == ShellState::Running && self.clear_detector.feed(data) {
             store.clear_on_finish();
         }
@@ -390,6 +420,7 @@ impl Relay {
         let mut store = ipc::lock(&self.store);
         match mark {
             Mark::Start { cwd, command } => {
+                self.unclaimed = None;
                 self.clear_detector.reset();
                 let command = command.trim_end_matches(['\n', '\r']).to_string();
                 let home = std::env::var("HOME").ok();
@@ -397,10 +428,28 @@ impl Relay {
                 store.begin(Some(command), cwd);
             }
             Mark::StartUnrecorded => {
+                self.unclaimed = None;
                 self.clear_detector.reset();
                 store.begin(None, None);
             }
-            Mark::End(code) => store.finish(code),
+            Mark::Rejected { cwd, command } => {
+                // The shell read the line and refused it. What it printed since Enter is the
+                // reason. A line that printed nothing (a comment, an alias for nothing) did not
+                // fail, so it stays out of the history.
+                let output = self.unclaimed.take().unwrap_or_default();
+                let command = command.trim_end_matches(['\n', '\r']).to_string();
+                let reason = rejection_reason(&output, &command);
+                if !reason.is_empty() {
+                    let home = std::env::var("HOME").ok();
+                    let cwd = cwd.map(|cwd| abbreviate_home(&cwd, home.as_deref()));
+                    store.begin(Some(command), cwd);
+                    store.push_output(reason.as_bytes());
+                }
+            }
+            Mark::End(code) => {
+                self.unclaimed = None;
+                store.finish(code);
+            }
         }
     }
 
@@ -410,12 +459,23 @@ impl Relay {
             match item {
                 InputItem::Data(data) => {
                     self.note_screen_clear_at_prompt(&data);
+                    self.note_line_accepted(&data);
                     self.to_child.extend_from_slice(&data);
                 }
                 InputItem::CopyShortcut => self.on_copy_shortcut(),
             }
         }
         self.flush_to_child()
+    }
+
+    /// Enter at a prompt. From here until a command starts, what the shell prints is kept in
+    /// case the shell rejects the line.
+    fn note_line_accepted(&mut self, input: &[u8]) {
+        if input.iter().any(|b| matches!(b, b'\r' | b'\n'))
+            && ipc::lock(&self.store).state() == ShellState::Idle
+        {
+            self.unclaimed = Some(Vec::new());
+        }
     }
 
     /// Cmd+K in Ghostty and Ctrl+L both reach the shell as a form feed. At a prompt they clear
@@ -507,4 +567,48 @@ fn write_all_blocking(fd: BorrowedFd<'_>, mut data: &[u8]) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_reason_is_what_the_shell_printed_after_enter() {
+        let raw = b"\r\nzsh: parse error near `)'\r\n";
+        assert_eq!(rejection_reason(raw, "echo )"), "zsh: parse error near `)'");
+    }
+
+    #[test]
+    fn the_redraw_of_the_line_is_not_part_of_the_reason() {
+        let raw = b"echo )\r\r\nzsh: parse error near `)'\r\n";
+        assert_eq!(rejection_reason(raw, "echo )"), "zsh: parse error near `)'");
+        let with_prompt = b"\x1b[1m~ %\x1b[0m echo )\r\r\nzsh: parse error near `)'\r\n";
+        assert_eq!(
+            rejection_reason(with_prompt, "echo )"),
+            "zsh: parse error near `)'"
+        );
+    }
+
+    #[test]
+    fn only_the_last_line_of_a_multi_line_command_is_redrawn() {
+        let raw = b"b' )\r\nzsh: parse error near `)'\r\n";
+        assert_eq!(
+            rejection_reason(raw, "echo 'a\nb' )"),
+            "zsh: parse error near `)'"
+        );
+    }
+
+    #[test]
+    fn a_line_that_printed_nothing_has_no_reason() {
+        assert_eq!(rejection_reason(b"", "# note"), "");
+        assert_eq!(rejection_reason(b"\r\n", "# note"), "");
+        assert_eq!(rejection_reason(b"# note\r\n\x1b[K", "# note"), "");
+    }
+
+    #[test]
+    fn a_message_that_merely_resembles_the_line_is_kept() {
+        let raw = b"zsh: no such file: x\r\n";
+        assert_eq!(rejection_reason(raw, "cat x"), "zsh: no such file: x");
+    }
 }

@@ -173,27 +173,59 @@ if [[ -n $TERMSCRIBE_SOCKET && -z $_termscribe_loaded ]]; then
     source "$GHOSTTY_RESOURCES_DIR/shell-integration/zsh/ghostty-integration"
   fi
 
+  typeset -g _termscribe_line=
+
   _termscribe_mark() {
     print -rn -- $'\e]7733;ts;'"$1"$'\a' >/dev/tty 2>/dev/null
   }
 
+  # Escapes text for a mark. The result is in REPLY, so no subshell is needed.
+  _termscribe_encode() {
+    REPLY=${1//\%/%25}
+    REPLY=${REPLY//$'\e'/%1B}
+    REPLY=${REPLY//$'\a'/%07}
+  }
+
+  # The mark payload `<dir>;<command>` for the current directory and the given text.
+  _termscribe_where_and_what() {
+    _termscribe_encode "$PWD"
+    local dir=${REPLY//;/%3B}
+    _termscribe_encode "$1"
+    REPLY="$dir;$REPLY"
+  }
+
+  # zsh calls this for every line it reads, before it runs the line. `preexec` does not run for
+  # a line zsh rejects, such as a syntax error, so the precmd below uses this to tell that
+  # a line was read and never started.
+  _termscribe_addhistory() {
+    _termscribe_line=$1
+    return 0
+  }
+
   _termscribe_preexec() {
+    _termscribe_line=
     if [[ -o histignorespace && $1 == ' '* ]]; then
       _termscribe_mark x
     else
-      local cmd=${1//\%/%25}
-      cmd=${cmd//$'\e'/%1B}
-      cmd=${cmd//$'\a'/%07}
-      local dir=${PWD//\%/%25}
-      dir=${dir//$'\e'/%1B}
-      dir=${dir//$'\a'/%07}
-      dir=${dir//;/%3B}
-      _termscribe_mark "s;$dir;$cmd"
+      _termscribe_where_and_what "$1"
+      _termscribe_mark "s;$REPLY"
     fi
   }
 
   _termscribe_precmd() {
     local code=$?
+    if [[ -n $_termscribe_line ]]; then
+      local line=${_termscribe_line%$'\n'}
+      _termscribe_line=
+      # The line was read and no command started. The relay has the error message that zsh
+      # printed, and ignores the line when there was none (a comment, for example). zsh gives
+      # no status for a rejected line, so say 1.
+      if [[ -n ${line//[[:space:]]/} ]] && ! [[ -o histignorespace && $line == ' '* ]]; then
+        _termscribe_where_and_what "$line"
+        _termscribe_mark "r;$REPLY"
+        code=1
+      fi
+    fi
     _termscribe_mark "e;$code"
   }
 
@@ -208,6 +240,7 @@ if [[ -n $TERMSCRIBE_SOCKET && -z $_termscribe_loaded ]]; then
   bindkey -M viins '@TRIGGER@' _termscribe_copy_widget 2>/dev/null
   bindkey -M vicmd '@TRIGGER@' _termscribe_copy_widget 2>/dev/null
 
+  zshaddhistory_functions=(_termscribe_addhistory $zshaddhistory_functions)
   preexec_functions+=(_termscribe_preexec)
   precmd_functions=(_termscribe_precmd $precmd_functions)
 

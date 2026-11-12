@@ -5,6 +5,9 @@
 //! - `s;<cwd>;<command>` means a command started in directory `<cwd>`. Both parts are
 //!   percent-encoded for `%`, ESC and BEL, and the directory also for `;`. An empty `<cwd>`
 //!   means the shell did not report one.
+//! - `r;<cwd>;<command>` means the shell read a line and rejected it before running anything, for
+//!   example because of a syntax error. It is encoded like `s`. The shell has already printed
+//!   its error by then, so the relay supplies that output from what it saw after the Enter key.
 //! - `x` means a command started that must not be recorded.
 //! - `e;<status>` means the command ended and the shell is back at a prompt.
 //!
@@ -21,6 +24,12 @@ pub enum Mark {
     /// A command started.
     Start {
         /// The directory it started in, when the shell reported one.
+        cwd: Option<String>,
+        command: String,
+    },
+    /// The shell rejected a line without running it. Its error message came before this mark.
+    Rejected {
+        /// The directory the shell was in, when it reported one.
         cwd: Option<String>,
         command: String,
     },
@@ -123,12 +132,14 @@ fn parse_payload(payload: &[u8]) -> Option<Mark> {
     let text = std::str::from_utf8(payload).ok()?;
     let (kind, rest) = text.split_once(';').unwrap_or((text, ""));
     match kind {
-        "s" => {
+        "s" | "r" => {
             let (cwd, command) = rest.split_once(';').unwrap_or(("", rest));
-            let cwd = percent_decode(cwd);
-            Some(Mark::Start {
-                cwd: Some(cwd).filter(|cwd| !cwd.is_empty()),
-                command: percent_decode(command),
+            let cwd = Some(percent_decode(cwd)).filter(|cwd| !cwd.is_empty());
+            let command = percent_decode(command);
+            Some(if kind == "s" {
+                Mark::Start { cwd, command }
+            } else {
+                Mark::Rejected { cwd, command }
             })
         }
         "x" => Some(Mark::StartUnrecorded),
@@ -161,8 +172,12 @@ fn percent_decode(text: &str) -> String {
 pub fn encode(mark: &Mark) -> Vec<u8> {
     let mut out = PREFIX.to_vec();
     match mark {
-        Mark::Start { cwd, command } => {
-            out.extend_from_slice(b"s;");
+        Mark::Start { cwd, command } | Mark::Rejected { cwd, command } => {
+            out.extend_from_slice(if matches!(mark, Mark::Start { .. }) {
+                b"s;"
+            } else {
+                b"r;"
+            });
             if let Some(cwd) = cwd {
                 out.extend_from_slice(percent_encode(cwd).replace(';', "%3B").as_bytes());
             }
@@ -214,6 +229,15 @@ mod tests {
 
     fn data(text: &str) -> Item {
         Item::Data(text.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn a_rejected_line_is_its_own_kind_of_mark() {
+        let mark = Mark::Rejected {
+            cwd: Some("/tmp/a b".into()),
+            command: "export X=<oops>".into(),
+        };
+        assert_eq!(scan_all(&[&encode(&mark)]), [Item::Mark(mark)]);
     }
 
     #[test]
