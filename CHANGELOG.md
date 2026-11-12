@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/mhmdxsadk/termscribe/compare/v0.3.0...v0.3.1) (2026-11-12)
+
+
+### Bug Fixes
+
+* **shell:** record lines zsh rejects ([8f75e2e](https://github.com/mhmdxsadk/termscribe/commit/8f75e2e607a0e0de36713d71f7ac8fdbeb2bda08))
+
 ## [0.3.0](https://github.com/mhmdxsadk/termscribe/compare/v0.2.3...v0.3.0) (2026-11-08)
 
 
