@@ -14,6 +14,7 @@ use crate::ghostty::{self, Change, KeybindChange};
 use crate::ipc::{self, Request, Response, SOCKET_ENV};
 use crate::relay;
 use crate::shell::{Shell, legacy_init_script};
+use crate::ssh;
 use crate::transcript::Selection;
 use crate::zshrc;
 
@@ -78,6 +79,17 @@ enum Command {
         #[arg(long)]
         shell: Option<String>,
     },
+    /// Connect with ssh and record the commands you run on the other machine
+    #[command(
+        disable_help_flag = true,
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
+    Ssh {
+        /// What you would give to ssh
+        #[arg(value_name = "SSH_ARGS", num_args = 0.., allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
     /// What termscribe 0.1.0 asked you to evaluate in ~/.zshrc
     #[command(hide = true)]
     Init {
@@ -105,11 +117,18 @@ pub fn accept_bare_flags<I>(args: I) -> Vec<OsString>
 where
     I: IntoIterator<Item = OsString>,
 {
+    let mut in_ssh = false;
     args.into_iter()
         .enumerate()
-        .map(|(index, arg)| match arg.to_str() {
-            Some(word) if index > 0 && BARE_FLAGS.contains(&word) => format!("--{word}").into(),
-            _ => arg,
+        .map(|(index, arg)| {
+            // Everything after `ssh` belongs to ssh, where `all` could be a host name.
+            in_ssh = in_ssh || (index == 1 && arg == "ssh");
+            match arg.to_str() {
+                Some(word) if index > 0 && !in_ssh && BARE_FLAGS.contains(&word) => {
+                    format!("--{word}").into()
+                }
+                _ => arg,
+            }
         })
         .collect()
 }
@@ -184,6 +203,10 @@ pub fn main() -> ExitCode {
         }
         Some(Command::Relay { shell }) => {
             let code = relay::run(shell);
+            ExitCode::from(u8::try_from(code).unwrap_or(1))
+        }
+        Some(Command::Ssh { args }) => {
+            let code = ssh::run(args);
             ExitCode::from(u8::try_from(code).unwrap_or(1))
         }
         Some(Command::Setup) => finish(run_setup()),

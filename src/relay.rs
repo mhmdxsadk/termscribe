@@ -27,7 +27,7 @@ use crate::input::{COPY_TRIGGER, InputFilter, InputItem};
 use crate::ipc::{self, SOCKET_ENV, SharedStore};
 use crate::marks::{Item, Mark, MarkScanner};
 use crate::screen::ClearDetector;
-use crate::shell::{BIN_ENV, USER_ZDOTDIR_ENV, write_shim};
+use crate::shell::{BIN_ENV, NONCE_ENV, USER_ZDOTDIR_ENV, new_nonce, write_shim};
 use crate::store::{Limits, ShellState, Store};
 use crate::transcript::Selection;
 
@@ -196,6 +196,12 @@ struct Relay {
     /// started. A line that zsh rejects (a syntax error, for instance) never starts a command,
     /// so this is the only place its error message is seen. `None` when no line is waiting.
     unclaimed: Option<Vec<u8>>,
+    /// The secret that marks from a shell on another machine must carry. `termscribe ssh` hands
+    /// it to that shell, and nothing else that scrolls past can know it.
+    nonce: String,
+    /// A shell on another machine is the one at the prompt. It started a command since the
+    /// local command that opened the connection, and the local shell has not come back yet.
+    remote_active: bool,
     to_child: Vec<u8>,
     stdin_open: bool,
     exit_status: Option<ExitStatus>,
@@ -230,6 +236,7 @@ impl Relay {
 
         let signals = Signals::install().context("could not install signal handlers")?;
 
+        let nonce = new_nonce().context("could not create a session secret")?;
         let mut command = Command::new(shell);
         command
             .arg0(login_name(shell))
@@ -237,6 +244,7 @@ impl Relay {
             .stdout(Stdio::from(pty.slave.try_clone()?))
             .stderr(Stdio::from(pty.slave))
             .env(SOCKET_ENV, &socket_path)
+            .env(NONCE_ENV, &nonce)
             .env("ZDOTDIR", &shim_dir)
             .env(
                 USER_ZDOTDIR_ENV,
@@ -273,6 +281,8 @@ impl Relay {
             filter: InputFilter::new(),
             clear_detector: ClearDetector::new(),
             unclaimed: None,
+            nonce,
+            remote_active: false,
             to_child: Vec::new(),
             stdin_open: true,
             exit_status: None,
@@ -417,15 +427,53 @@ impl Relay {
     }
 
     fn apply_mark(&mut self, mark: Mark) {
+        match mark {
+            Mark::Remote { nonce, host, mark } => {
+                // Output that only looks like a mark from a remote shell is dropped.
+                if nonce == self.nonce {
+                    self.apply_shell_mark(*mark, Some(host));
+                }
+            }
+            mark => self.apply_shell_mark(mark, None),
+        }
+    }
+
+    /// Applies a mark from the local shell, or from the shell on `host` when that is given.
+    fn apply_shell_mark(&mut self, mark: Mark, host: Option<String>) {
         let mut store = ipc::lock(&self.store);
+        match &host {
+            // The first mark from the remote shell: the local command that opened the connection
+            // (`termscribe ssh host`) is over as far as the history goes. It keeps what it
+            // printed so far, such as a banner.
+            Some(_) if !self.remote_active => {
+                self.remote_active = true;
+                if store.state() == ShellState::Running {
+                    store.finish(None);
+                }
+            }
+            Some(_) => {}
+            // The local shell speaks again, so the connection is closed or never was one.
+            None => {
+                if matches!(
+                    mark,
+                    Mark::Start { .. } | Mark::StartUnrecorded | Mark::End(_)
+                ) {
+                    self.remote_active = false;
+                }
+            }
+        }
+        // A directory on another machine has its own home, which the shell already wrote as `~`.
+        let home = host.is_none().then(|| std::env::var("HOME").ok()).flatten();
+        let place = |cwd: Option<String>| match &host {
+            Some(_) => cwd,
+            None => cwd.map(|cwd| abbreviate_home(&cwd, home.as_deref())),
+        };
         match mark {
             Mark::Start { cwd, command } => {
                 self.unclaimed = None;
                 self.clear_detector.reset();
                 let command = command.trim_end_matches(['\n', '\r']).to_string();
-                let home = std::env::var("HOME").ok();
-                let cwd = cwd.map(|cwd| abbreviate_home(&cwd, home.as_deref()));
-                store.begin(Some(command), cwd);
+                store.begin_on(Some(command), place(cwd), host);
             }
             Mark::StartUnrecorded => {
                 self.unclaimed = None;
@@ -440,9 +488,7 @@ impl Relay {
                 let command = command.trim_end_matches(['\n', '\r']).to_string();
                 let reason = rejection_reason(&output, &command);
                 if !reason.is_empty() {
-                    let home = std::env::var("HOME").ok();
-                    let cwd = cwd.map(|cwd| abbreviate_home(&cwd, home.as_deref()));
-                    store.begin(Some(command), cwd);
+                    store.begin_on(Some(command), place(cwd), host);
                     store.push_output(reason.as_bytes());
                 }
             }
@@ -450,6 +496,8 @@ impl Relay {
                 self.unclaimed = None;
                 store.finish(code);
             }
+            // The scanner never nests these.
+            Mark::Remote { .. } => {}
         }
     }
 
@@ -489,11 +537,12 @@ impl Relay {
         }
     }
 
-    /// At a prompt, hand the shortcut to the shell so it can show the result with `zle -M`.
-    /// Anywhere else, copy quietly, because printing could corrupt a running program's screen.
+    /// At a local prompt, hand the shortcut to the shell so it can show the result with
+    /// `zle -M`. Anywhere else, copy quietly, because printing could corrupt a running program's
+    /// screen. A shell on another machine has no widget to hand it to.
     fn on_copy_shortcut(&mut self) {
         let state = ipc::lock(&self.store).state();
-        if state == ShellState::Idle {
+        if state == ShellState::Idle && !self.remote_active {
             self.to_child.extend_from_slice(COPY_TRIGGER);
         } else {
             let store = Arc::clone(&self.store);

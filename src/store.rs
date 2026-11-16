@@ -77,10 +77,16 @@ impl Store {
     /// directory it started in, when the shell reported one.
     /// An earlier command that never reported its end is dropped.
     pub fn begin(&mut self, command: Option<String>, cwd: Option<String>) {
+        self.begin_on(command, cwd, None);
+    }
+
+    /// Like `begin`, for a command that runs on another machine, named `host`.
+    pub fn begin_on(&mut self, command: Option<String>, cwd: Option<String>, host: Option<String>) {
         self.pending = Some(Pending {
             record: command.map(|command| {
                 let mut record = CommandRecord::new(command, Vec::new(), None);
                 record.cwd = cwd;
+                record.host = host;
                 record
             }),
         });

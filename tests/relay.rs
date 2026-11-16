@@ -166,11 +166,16 @@ impl Session {
 
     /// Types a command and waits for the next prompt. Returns what the terminal showed.
     fn run(&mut self, command: &str) -> String {
+        self.run_until(command, PROMPT)
+    }
+
+    /// Like `run`, for a shell whose prompt is `prompt`.
+    fn run_until(&mut self, command: &str, prompt: &str) -> String {
         let start = self.len();
         self.send(format!("{command}\n").as_bytes());
         // The first prompt after the echoed command marks completion.
         let echoed = self.wait_for_text("\n", start);
-        let shown = self.wait_for_text(PROMPT, start + echoed.len());
+        let shown = self.wait_for_text(prompt, start + echoed.len());
         // Give the relay a moment to handle the end mark that precedes the prompt.
         thread::sleep(Duration::from_millis(30));
         shown
@@ -841,4 +846,158 @@ fn disabling_termscribe_starts_the_shell_without_a_relay() {
 fn format_options_are_available_to_tests() {
     // Keeps the public API used by the tests honest.
     let _ = FormatOptions::default();
+}
+
+/// A stand-in for `ssh`: it runs the remote command on this machine, with its own home and
+/// without the variables that a real connection would not carry over.
+fn fake_ssh(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).expect("bin dir");
+    let script = r#"#!/bin/sh
+for last; do :; done
+unset TERMSCRIBE_SOCKET TERMSCRIBE_NONCE TERMSCRIBE_BIN TERMSCRIBE_USER_ZDOTDIR ZDOTDIR
+HOME=$FAKE_REMOTE_HOME
+TMPDIR=$HOME/tmp
+export HOME TMPDIR
+cd "$HOME" || exit 1
+exec sh -c "$last"
+"#;
+    std::fs::write(bin.join("ssh"), script).expect("write fake ssh");
+    std::fs::set_permissions(bin.join("ssh"), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod");
+    let remote = dir.join("remote");
+    std::fs::create_dir_all(remote.join("tmp")).expect("remote dirs");
+    std::fs::write(remote.join(".zshrc"), "PROMPT='REMOTE> '\nRPROMPT=\n").expect("remote zshrc");
+}
+
+const REMOTE_PROMPT: &str = "REMOTE> ";
+
+fn session_with_fake_ssh(dir: &Path) -> Session {
+    fake_ssh(dir);
+    start_with_fake_ssh(dir, &[])
+}
+
+/// A session where `ssh` is the stand-in. Only the user's `.zshrc` can put it first in PATH,
+/// because macOS reorders PATH in a login shell.
+fn start_with_fake_ssh(dir: &Path, extra_env: &[(&str, &str)]) -> Session {
+    let zshrc = format!(
+        "PROMPT='PROMPT> '\nRPROMPT=\nPATH={}:$PATH\n",
+        dir.join("bin").display()
+    );
+    let remote = dir.join("remote").display().to_string();
+    let mut env = vec![("FAKE_REMOTE_HOME", remote.as_str())];
+    env.extend_from_slice(extra_env);
+    Session::start_with(&[(".zshrc", &zshrc)], &env)
+}
+
+/// Connects with `termscribe ssh prod` and waits for the prompt on the other side.
+fn connect(s: &mut Session) {
+    let start = s.len();
+    s.send(b"termscribe ssh prod\n");
+    s.wait_for_text(REMOTE_PROMPT, start);
+    thread::sleep(Duration::from_millis(50));
+}
+
+#[test]
+fn commands_on_another_machine_are_recorded_one_by_one_with_the_host() {
+    require_zsh!();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = dir.path().canonicalize().expect("canonical");
+    let mut s = session_with_fake_ssh(&dir);
+    s.run("echo before");
+    connect(&mut s);
+    s.run_until("echo on the remote", REMOTE_PROMPT);
+    s.run_until("mkdir sub && cd sub", REMOTE_PROMPT);
+    s.run_until("false", REMOTE_PROMPT);
+    s.run_until("echo )", REMOTE_PROMPT);
+    s.run_until("exit", PROMPT);
+    s.run("echo after");
+
+    let markdown = s.markdown(Selection::All);
+    let expected = [
+        "$ echo before\nbefore\n",
+        "$ termscribe ssh prod\n",
+        "prod:~ $ echo on the remote\non the remote\n",
+        "$ mkdir sub && cd sub\n",
+        "~/sub $ false\n[exit 1]\n",
+        "$ echo )\n",
+        "$ exit\n",
+        "~ $ echo after\nafter\n",
+    ];
+    let mut at = 0;
+    for part in expected {
+        let found = markdown[at..].find(part);
+        assert!(
+            found.is_some(),
+            "missing {part:?} after byte {at} in:\n{markdown}"
+        );
+        at += found.unwrap() + part.len();
+    }
+    assert!(markdown.contains("parse error"), "{markdown}");
+}
+
+#[test]
+fn the_shortcut_copies_while_connected() {
+    require_zsh!();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = dir.path().canonicalize().expect("canonical");
+    let mut s = session_with_fake_ssh(&dir);
+    connect(&mut s);
+    s.run_until("echo over there", REMOTE_PROMPT);
+    s.send(COPY_TRIGGER);
+    let copied = s.wait_for_clipboard();
+    assert!(copied.contains("prod:~ $ echo over there"), "{copied}");
+    s.run_until("exit", PROMPT);
+}
+
+#[test]
+fn output_that_looks_like_a_remote_mark_is_ignored() {
+    require_zsh!();
+    let mut s = Session::start();
+    s.run(r"printf '\033]7733;ts;@wrong;evil;s;~;sneaky\007shown\n'");
+    let markdown = s.markdown(Selection::All);
+    assert!(!markdown.contains("evil:"), "{markdown}");
+    assert!(markdown.contains("shown"), "{markdown}");
+}
+
+#[test]
+fn the_remote_startup_files_are_removed_when_the_shell_ends() {
+    require_zsh!();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = dir.path().canonicalize().expect("canonical");
+    let mut s = session_with_fake_ssh(&dir);
+    connect(&mut s);
+    let leftovers = |dir: &Path| {
+        std::fs::read_dir(dir.join("remote/tmp"))
+            .expect("tmp")
+            .count()
+    };
+    assert_eq!(leftovers(&dir), 1, "no startup directory while connected");
+    s.run_until("exit", PROMPT);
+    assert_eq!(leftovers(&dir), 0, "startup directory left behind");
+}
+
+#[test]
+fn a_machine_without_zsh_still_gives_a_shell() {
+    require_zsh!();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = dir.path().canonicalize().expect("canonical");
+    fake_ssh(&dir);
+    // A PATH for the remote side that has `sh` and friends but no zsh.
+    let script = std::fs::read_to_string(dir.join("bin/ssh")).expect("read");
+    let script = script.replace(
+        "exec sh -c",
+        "SHELL=/bin/sh; export SHELL; mkdir -p \"$HOME/nozsh\"; for c in sh base64 printf mktemp rm rmdir cat; do ln -sf \"$(command -v $c)\" \"$HOME/nozsh/$c\"; done\nPATH=$HOME/nozsh\nexport PATH\nexec /bin/sh -c",
+    );
+    std::fs::write(dir.join("bin/ssh"), script).expect("write");
+    let mut s = start_with_fake_ssh(&dir, &[]);
+    let start = s.len();
+    s.send(b"termscribe ssh prod\n");
+    s.wait_for_text("zsh was not found", start);
+    let start = s.len();
+    s.send(b"echo still-$((1+1))\n");
+    s.wait_for_text("still-2", start);
+    s.send(b"exit\n");
+    s.wait_for_text("PROMPT> ", start);
 }
