@@ -859,9 +859,10 @@ for last; do :; done
 unset TERMSCRIBE_SOCKET TERMSCRIBE_NONCE TERMSCRIBE_BIN TERMSCRIBE_USER_ZDOTDIR ZDOTDIR
 HOME=$FAKE_REMOTE_HOME
 TMPDIR=$HOME/tmp
-export HOME TMPDIR
+SHELL=${FAKE_REMOTE_SHELL:-/bin/zsh}
+export HOME TMPDIR SHELL
 cd "$HOME" || exit 1
-exec sh -c "$last"
+exec ${FAKE_REMOTE_SH:-sh} -c "$last"
 "#;
     std::fs::write(bin.join("ssh"), script).expect("write fake ssh");
     std::fs::set_permissions(bin.join("ssh"), std::fs::Permissions::from_mode(0o755))
@@ -869,6 +870,11 @@ exec sh -c "$last"
     let remote = dir.join("remote");
     std::fs::create_dir_all(remote.join("tmp")).expect("remote dirs");
     std::fs::write(remote.join(".zshrc"), "PROMPT='REMOTE> '\nRPROMPT=\n").expect("remote zshrc");
+    std::fs::write(
+        remote.join(".bash_profile"),
+        "export BASH_SILENCE_DEPRECATION_WARNING=1\nPS1='REMOTE> '\nHISTCONTROL=ignoreboth\n",
+    )
+    .expect("remote bash profile");
 }
 
 const REMOTE_PROMPT: &str = "REMOTE> ";
@@ -979,25 +985,146 @@ fn the_remote_startup_files_are_removed_when_the_shell_ends() {
 }
 
 #[test]
-fn a_machine_without_zsh_still_gives_a_shell() {
+fn a_machine_with_another_shell_still_gives_a_shell() {
     require_zsh!();
     let dir = tempfile::tempdir().expect("temp dir");
     let dir = dir.path().canonicalize().expect("canonical");
     fake_ssh(&dir);
-    // A PATH for the remote side that has `sh` and friends but no zsh.
-    let script = std::fs::read_to_string(dir.join("bin/ssh")).expect("read");
-    let script = script.replace(
-        "exec sh -c",
-        "SHELL=/bin/sh; export SHELL; mkdir -p \"$HOME/nozsh\"; for c in sh base64 printf mktemp rm rmdir cat; do ln -sf \"$(command -v $c)\" \"$HOME/nozsh/$c\"; done\nPATH=$HOME/nozsh\nexport PATH\nexec /bin/sh -c",
-    );
-    std::fs::write(dir.join("bin/ssh"), script).expect("write");
-    let mut s = start_with_fake_ssh(&dir, &[]);
+    let mut s = start_with_fake_ssh(&dir, &[("FAKE_REMOTE_SHELL", "/bin/sh")]);
     let start = s.len();
     s.send(b"termscribe ssh prod\n");
-    s.wait_for_text("zsh was not found", start);
+    s.wait_for_text("it records zsh and bash", start);
     let start = s.len();
     s.send(b"echo still-$((1+1))\n");
     s.wait_for_text("still-2", start);
     s.send(b"exit\n");
     s.wait_for_text("PROMPT> ", start);
+}
+
+fn bash_available() -> bool {
+    Path::new("/bin/bash").exists()
+}
+
+fn start_with_remote_bash(dir: &Path) -> Session {
+    fake_ssh(dir);
+    start_with_fake_ssh(dir, &[("FAKE_REMOTE_SHELL", "/bin/bash")])
+}
+
+#[test]
+fn bash_on_another_machine_is_recorded_command_by_command() {
+    require_zsh!();
+    if !bash_available() {
+        eprintln!("skipping: /bin/bash not found");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = dir.path().canonicalize().expect("canonical");
+    let mut s = start_with_remote_bash(&dir);
+    s.run("echo before");
+    connect(&mut s);
+    s.run_until("echo on the remote", REMOTE_PROMPT);
+    s.run_until("mkdir sub && cd sub", REMOTE_PROMPT);
+    s.run_until("false", REMOTE_PROMPT);
+    s.run_until("echo again", REMOTE_PROMPT);
+    s.run_until("echo again", REMOTE_PROMPT);
+    s.run_until("echo a | cat", REMOTE_PROMPT);
+    s.run_until(" echo secret", REMOTE_PROMPT);
+    s.run_until("echo multi; echo line", REMOTE_PROMPT);
+    s.run_until("exit", PROMPT);
+    s.run("echo after");
+
+    let markdown = s.markdown(Selection::All);
+    let expected = [
+        "$ echo before\nbefore\n",
+        "$ termscribe ssh prod\n",
+        "prod:~ $ echo on the remote\non the remote\n",
+        "$ mkdir sub && cd sub\n",
+        "~/sub $ false\n[exit 1]\n",
+        "$ echo again\nagain\n",
+        "$ echo again\nagain\n",
+        "$ echo a | cat\na\n",
+        "$ echo multi; echo line\nmulti\nline\n",
+        "$ exit\n",
+        "~ $ echo after\nafter\n",
+    ];
+    let mut at = 0;
+    for part in expected {
+        let found = markdown[at..].find(part);
+        assert!(
+            found.is_some(),
+            "missing {part:?} after byte {at} in:\n{markdown}"
+        );
+        at += found.unwrap() + part.len();
+    }
+    assert!(!markdown.contains("secret"), "{markdown}");
+}
+
+#[test]
+fn the_remote_bash_startup_files_are_removed_when_the_shell_ends() {
+    require_zsh!();
+    if !bash_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = dir.path().canonicalize().expect("canonical");
+    let mut s = start_with_remote_bash(&dir);
+    connect(&mut s);
+    let leftovers = |dir: &Path| {
+        std::fs::read_dir(dir.join("remote/tmp"))
+            .expect("tmp")
+            .count()
+    };
+    assert_eq!(leftovers(&dir), 1);
+    s.run_until("exit", PROMPT);
+    assert_eq!(leftovers(&dir), 0, "startup directory left behind");
+}
+
+#[test]
+fn remote_bash_keeps_the_users_prompt_command_and_status() {
+    require_zsh!();
+    if !bash_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = dir.path().canonicalize().expect("canonical");
+    fake_ssh(&dir);
+    std::fs::write(
+        dir.join("remote/.bash_profile"),
+        "PS1='REMOTE> '\nPROMPT_COMMAND='echo user-hook-ran'\n",
+    )
+    .expect("profile");
+    let mut s = start_with_fake_ssh(&dir, &[("FAKE_REMOTE_SHELL", "/bin/bash")]);
+    connect(&mut s);
+    let shown = s.run_until("false", REMOTE_PROMPT);
+    assert!(shown.contains("user-hook-ran"), "{shown:?}");
+    s.run_until("exit", PROMPT);
+    let markdown = s.markdown(Selection::All);
+    assert!(markdown.contains("$ false\n[exit 1]"), "{markdown}");
+}
+
+#[test]
+fn the_remote_launcher_runs_under_dash() {
+    require_zsh!();
+    if !Path::new("/bin/dash").exists() || !bash_available() {
+        eprintln!("skipping: /bin/dash or /bin/bash not found");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = dir.path().canonicalize().expect("canonical");
+    fake_ssh(&dir);
+    let mut s = start_with_fake_ssh(
+        &dir,
+        &[
+            ("FAKE_REMOTE_SHELL", "/bin/bash"),
+            ("FAKE_REMOTE_SH", "/bin/dash"),
+        ],
+    );
+    connect(&mut s);
+    s.run_until("echo under dash", REMOTE_PROMPT);
+    s.run_until("exit", PROMPT);
+    let markdown = s.markdown(Selection::All);
+    assert!(
+        markdown.contains("prod:~ $ echo under dash\nunder dash"),
+        "{markdown}"
+    );
 }

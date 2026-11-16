@@ -64,6 +64,16 @@ pub fn shim_files() -> Vec<ShimFile> {
     ]
 }
 
+/// The file that starts bash on another machine (`termscribe ssh`). bash needs no shim
+/// directory: `bash --rcfile` reads this file instead of `~/.bashrc`, and the file runs the
+/// user's own startup files the way a login shell would.
+pub fn bash_files() -> Vec<ShimFile> {
+    vec![ShimFile {
+        name: "termscribe.bashrc",
+        content: REMOTE_BASHRC.to_string(),
+    }]
+}
+
 /// Writes the shim files into `dir`. The directory is private to the user, and it replaces
 /// whatever an earlier session with the same process id left there.
 pub fn write_shim(dir: &Path) -> io::Result<()> {
@@ -287,6 +297,105 @@ if [[ -z $_termscribe_loaded ]] && [[ -n $TERMSCRIBE_SOCKET || -n $TERMSCRIBE_RE
 fi
 "#;
 
+/// The startup file for bash on another machine. It starts like a login shell, then adds the
+/// hooks. bash has no hook that runs before a command and knows the whole line, so a DEBUG trap
+/// marks the start of the first command after each prompt, and `PROMPT_COMMAND` marks the end.
+/// The shell's own history supplies the text of the line.
+const REMOTE_BASHRC: &str = r##"# termscribe startup file for bash. `termscribe ssh` writes it for this session and removes it
+# when the session ends. It runs your own startup files as a login shell would.
+if [ -r /etc/profile ]; then . /etc/profile; fi
+for _termscribe_file in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+  if [ -r "$_termscribe_file" ]; then . "$_termscribe_file"; break; fi
+done
+unset _termscribe_file
+
+if [ -n "$TERMSCRIBE_REMOTE" ] && [ -z "$_termscribe_loaded" ]; then
+  if [ -n "$(trap -p DEBUG)" ]; then
+    echo "termscribe: your startup files already set a DEBUG trap, so commands on this machine are not recorded one by one." >&2
+  else
+    _termscribe_loaded=1
+    # 1 while the shell waits at a prompt, so the next command is the start of a new line.
+    _termscribe_ready=0
+    _termscribe_status=0
+    _termscribe_histnum=
+
+    _termscribe_mark() {
+      printf '\033]7733;ts;@%s;%s;%s\007' "$TERMSCRIBE_REMOTE" "$_termscribe_host" "$1" >/dev/tty 2>/dev/null
+    }
+
+    # Escapes text for a mark. The result is in REPLY.
+    _termscribe_encode() {
+      REPLY=${1//\%/%25}
+      REPLY=${REPLY//$'\033'/%1B}
+      REPLY=${REPLY//$'\007'/%07}
+    }
+
+    _termscribe_encode "$TERMSCRIBE_HOST"
+    _termscribe_host=${REPLY//;/%3B}
+
+    # The mark payload `<dir>;<command>`. The directory is written with `~` for home, because
+    # the relay cannot know where home is on this machine.
+    _termscribe_where_and_what() {
+      local place=$PWD rest
+      if [ -n "$HOME" ] && { [ "$PWD" = "$HOME" ] || [[ $PWD == "$HOME"/* ]]; }; then
+        rest=${PWD#"$HOME"}
+        place="~$rest"
+      fi
+      _termscribe_encode "$place"
+      local dir=${REPLY//;/%3B}
+      _termscribe_encode "$1"
+      REPLY="$dir;$REPLY"
+    }
+
+    # Runs before every simple command. Only the first one after a prompt starts a command.
+    _termscribe_debug() {
+      [ "$_termscribe_ready" = 1 ] || return 0
+      [ -z "$COMP_LINE" ] || return 0
+      _termscribe_ready=0
+      local entry num text
+      entry=$(HISTTIMEFORMAT= builtin history 1 2>/dev/null)
+      entry=${entry#"${entry%%[![:space:]]*}"}
+      num=${entry%%[!0-9]*}
+      text=${entry#"$num"}
+      text=${text:2}
+      if [ -z "$num" ]; then
+        # No history to read, so the first command of the line is the best there is.
+        text=$BASH_COMMAND
+      elif [ "$num" = "$_termscribe_histnum" ] && [[ $HISTCONTROL == *ignorespace* || $HISTCONTROL == *ignoreboth* ]]; then
+        # The line did not enter the history, either because it is a repeat or because it starts
+        # with a space. A repeat starts like the previous line. Anything else is a private line.
+        case $text in
+          "$BASH_COMMAND"*) ;;
+          *) case $BASH_COMMAND in "$text"*) ;; *) _termscribe_mark x; return 0 ;; esac ;;
+        esac
+      fi
+      _termscribe_histnum=$num
+      _termscribe_where_and_what "$text"
+      _termscribe_mark "s;$REPLY"
+      return 0
+    }
+
+    # PROMPT_COMMAND runs ours first, to read the status before anything changes it and to send
+    # the end mark before your own prompt commands print anything, and last, to arm the trap
+    # for the next line.
+    _termscribe_first() {
+      _termscribe_status=$?
+      _termscribe_mark "e;$_termscribe_status"
+      return $_termscribe_status
+    }
+    _termscribe_last() {
+      _termscribe_ready=1
+    }
+    if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == "declare -a"* ]]; then
+      PROMPT_COMMAND=(_termscribe_first "${PROMPT_COMMAND[@]}" _termscribe_last)
+    else
+      PROMPT_COMMAND="_termscribe_first"$'\n'"${PROMPT_COMMAND}"$'\n'"_termscribe_last"
+    fi
+    trap '_termscribe_debug' DEBUG
+  fi
+fi
+"##;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +413,23 @@ mod tests {
         let hooks = file("termscribe.zsh");
         assert!(hooks.contains(r"'\e[9000~'"));
         assert!(!hooks.contains("@TRIGGER@"));
+    }
+
+    #[test]
+    fn the_bash_startup_file_parses_and_reads_the_remote_variables() {
+        let files = bash_files();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].content.contains("TERMSCRIBE_REMOTE"));
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("termscribe.bashrc");
+        std::fs::write(&path, &files[0].content).expect("write");
+        if let Ok(status) = std::process::Command::new("bash")
+            .arg("-n")
+            .arg(&path)
+            .status()
+        {
+            assert!(status.success());
+        }
     }
 
     #[test]
