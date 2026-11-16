@@ -202,6 +202,8 @@ struct Relay {
     /// A shell on another machine is the one at the prompt. It started a command since the
     /// local command that opened the connection, and the local shell has not come back yet.
     remote_active: bool,
+    /// The terminal is Ghostty, which decides from prompt marks whether Cmd+K goes to the shell.
+    tell_ghostty: bool,
     to_child: Vec<u8>,
     stdin_open: bool,
     exit_status: Option<ExitStatus>,
@@ -283,6 +285,7 @@ impl Relay {
             unclaimed: None,
             nonce,
             remote_active: false,
+            tell_ghostty: std::env::var_os("GHOSTTY_RESOURCES_DIR").is_some(),
             to_child: Vec::new(),
             stdin_open: true,
             exit_status: None,
@@ -431,10 +434,33 @@ impl Relay {
             Mark::Remote { nonce, host, mark } => {
                 // Output that only looks like a mark from a remote shell is dropped.
                 if nonce == self.nonce {
+                    let announcement = self.prompt_announcement(&mark);
                     self.apply_shell_mark(*mark, Some(host));
+                    if let Some(sequence) = announcement {
+                        // Same stream as the shell's output, so it lands between the right bytes.
+                        let _ = write_all_blocking(io::stdout().as_fd(), sequence.as_bytes());
+                    }
                 }
             }
             mark => self.apply_shell_mark(mark, None),
+        }
+    }
+
+    /// What to tell the terminal about a mark from a shell on another machine. Ghostty sends
+    /// Cmd+K to the shell as a form feed only when it knows the cursor is at a prompt, and it
+    /// knows that from OSC 133 marks. The local zsh sends them, but the remote shell does not, so
+    /// without this Ghostty clears the screen itself and the relay never sees Cmd+K.
+    fn prompt_announcement(&self, mark: &Mark) -> Option<String> {
+        if !self.tell_ghostty {
+            return None;
+        }
+        match mark {
+            Mark::End(code) => Some(format!(
+                "\x1b]133;D;{}\x1b\\\x1b]133;A\x1b\\",
+                code.unwrap_or(0)
+            )),
+            Mark::Start { .. } | Mark::StartUnrecorded => Some("\x1b]133;C\x1b\\".to_string()),
+            _ => None,
         }
     }
 

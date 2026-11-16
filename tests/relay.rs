@@ -968,6 +968,55 @@ fn the_shortcut_copies_while_connected() {
 }
 
 #[test]
+fn a_remote_prompt_is_announced_to_ghostty_so_cmd_k_reaches_the_shell() {
+    require_zsh!();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = dir.path().canonicalize().expect("canonical");
+    fake_ssh(&dir);
+    let mut s = start_with_fake_ssh(&dir, &[("GHOSTTY_RESOURCES_DIR", "/nonexistent")]);
+    let start = s.len();
+    s.send(b"termscribe ssh prod\n");
+    let shown = s.wait_for_text(REMOTE_PROMPT, start);
+    // The prompt starts after a prompt mark, which is what Ghostty needs to forward Cmd+K.
+    let mark = shown.rfind("\x1b]133;A\x1b\\").expect("prompt mark");
+    assert!(mark < shown.rfind(REMOTE_PROMPT).unwrap(), "{shown:?}");
+    let start = s.len();
+    s.send(b"echo hi\n");
+    let shown = s.wait_for_text(REMOTE_PROMPT, start);
+    assert!(shown.contains("\x1b]133;C\x1b\\"), "{shown:?}");
+    assert!(shown.contains("\x1b]133;D;0\x1b\\"), "{shown:?}");
+}
+
+#[test]
+fn no_prompt_marks_are_added_outside_ghostty() {
+    require_zsh!();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = dir.path().canonicalize().expect("canonical");
+    let mut s = session_with_fake_ssh(&dir);
+    connect(&mut s);
+    s.run_until("echo hi", REMOTE_PROMPT);
+    assert!(!s.text_from(0).contains("\x1b]133;"));
+}
+
+#[test]
+fn clearing_the_screen_at_a_remote_prompt_starts_a_new_transcript() {
+    require_zsh!();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = dir.path().canonicalize().expect("canonical");
+    let mut s = session_with_fake_ssh(&dir);
+    connect(&mut s);
+    s.run_until("echo old", REMOTE_PROMPT);
+    let start = s.len();
+    s.send(&[0x0c]);
+    s.wait_for_text(REMOTE_PROMPT, start);
+    thread::sleep(Duration::from_millis(50));
+    s.run_until("echo new", REMOTE_PROMPT);
+    let since = s.markdown(Selection::SinceBoundary);
+    assert!(since.contains("echo new"), "{since}");
+    assert!(!since.contains("echo old"), "{since}");
+}
+
+#[test]
 fn output_that_looks_like_a_remote_mark_is_ignored() {
     require_zsh!();
     let mut s = Session::start();
