@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/mhmdxsadk/termscribe/compare/v0.4.0...v0.5.0) (2026-11-16)
+
+
+### Features
+
+* **ssh:** record bash on the remote machine ([#10](https://github.com/mhmdxsadk/termscribe/issues/10)) ([2293f75](https://github.com/mhmdxsadk/termscribe/commit/2293f75116cad185b7e05e8482b5c957686a9251))
+
 ## [0.4.0](https://github.com/mhmdxsadk/termscribe/compare/v0.3.1...v0.4.0) (2026-11-16)
 
 
