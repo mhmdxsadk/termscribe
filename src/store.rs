@@ -50,6 +50,9 @@ pub struct Store {
     finished_total: u64,
     /// Commands with an index below this are before the boundary.
     boundary: u64,
+    /// While a shell on another machine is at the prompt: the index of its first command. A
+    /// default transcript starts there, so it holds that session and nothing from outside it.
+    remote_scope: Option<u64>,
     pending: Option<Pending>,
     /// Move the boundary when the running command ends, because it cleared the screen.
     boundary_on_finish: bool,
@@ -63,6 +66,7 @@ impl Store {
             records: VecDeque::new(),
             finished_total: 0,
             boundary: 0,
+            remote_scope: None,
             pending: None,
             boundary_on_finish: false,
             state: ShellState::Starting,
@@ -145,11 +149,25 @@ impl Store {
         self.boundary = self.finished_total;
     }
 
+    /// A shell on another machine took over the prompt. Until `end_remote_scope`, a default
+    /// transcript holds only the commands that finish from now on.
+    pub fn start_remote_scope(&mut self) {
+        self.remote_scope = Some(self.finished_total);
+    }
+
+    /// The local shell has the prompt again.
+    pub fn end_remote_scope(&mut self) {
+        self.remote_scope = None;
+    }
+
     pub fn select(&self, selection: Selection) -> Transcript {
         let oldest_index = self.finished_total - self.records.len() as u64;
         let skip = match selection {
             Selection::All => 0,
-            Selection::SinceBoundary => self.boundary.saturating_sub(oldest_index) as usize,
+            Selection::SinceBoundary => self
+                .boundary
+                .max(self.remote_scope.unwrap_or(0))
+                .saturating_sub(oldest_index) as usize,
             Selection::Last(n) => self.records.len().saturating_sub(n),
         };
         Transcript::new(self.records.iter().skip(skip).cloned().collect())
@@ -183,6 +201,34 @@ mod tests {
         assert_eq!(commands(&all), ["a", "b"]);
         assert_eq!(all.records[1].exit_code, Some(1));
         assert_eq!(all.records[1].output, b"2");
+    }
+
+    #[test]
+    fn a_remote_scope_limits_the_default_transcript_until_it_ends() {
+        let mut store = Store::new(Limits::default());
+        run(&mut store, "local before", "", 0);
+        run(&mut store, "ssh host", "", 0);
+        store.start_remote_scope();
+        run(&mut store, "remote a", "", 0);
+        run(&mut store, "remote b", "", 0);
+        assert_eq!(
+            commands(&store.select(Selection::SinceBoundary)),
+            ["remote a", "remote b"]
+        );
+        assert_eq!(store.select(Selection::All).records.len(), 4);
+        assert_eq!(commands(&store.select(Selection::Last(1))), ["remote b"]);
+        store.end_remote_scope();
+        assert_eq!(store.select(Selection::SinceBoundary).records.len(), 4);
+    }
+
+    #[test]
+    fn a_boundary_inside_a_remote_scope_still_applies() {
+        let mut store = Store::new(Limits::default());
+        store.start_remote_scope();
+        run(&mut store, "a", "", 0);
+        store.set_boundary();
+        run(&mut store, "b", "", 0);
+        assert_eq!(commands(&store.select(Selection::SinceBoundary)), ["b"]);
     }
 
     #[test]

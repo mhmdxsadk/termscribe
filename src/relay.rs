@@ -450,6 +450,9 @@ impl Relay {
                 if store.state() == ShellState::Running {
                     store.finish(None);
                 }
+                // Copying from inside the session gives that session, not the local commands
+                // before it or the command that opened the connection.
+                store.start_remote_scope();
             }
             Some(_) => {}
             // The local shell speaks again, so the connection is closed or never was one.
@@ -459,6 +462,7 @@ impl Relay {
                     Mark::Start { .. } | Mark::StartUnrecorded | Mark::End(_)
                 ) {
                     self.remote_active = false;
+                    store.end_remote_scope();
                 }
             }
         }

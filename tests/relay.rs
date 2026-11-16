@@ -949,12 +949,22 @@ fn the_shortcut_copies_while_connected() {
     let dir = tempfile::tempdir().expect("temp dir");
     let dir = dir.path().canonicalize().expect("canonical");
     let mut s = session_with_fake_ssh(&dir);
+    s.run("echo local before");
     connect(&mut s);
     s.run_until("echo over there", REMOTE_PROMPT);
     s.send(COPY_TRIGGER);
     let copied = s.wait_for_clipboard();
     assert!(copied.contains("prod:~ $ echo over there"), "{copied}");
+    // Only the remote session: not the connection command, and nothing from before it.
+    assert!(!copied.contains("termscribe ssh"), "{copied}");
+    assert!(!copied.contains("local before"), "{copied}");
     s.run_until("exit", PROMPT);
+
+    // Back on this machine, a default transcript is everything since the boundary again.
+    let markdown = s.markdown(Selection::SinceBoundary);
+    assert!(markdown.contains("local before"), "{markdown}");
+    assert!(markdown.contains("termscribe ssh prod"), "{markdown}");
+    assert!(markdown.contains("echo over there"), "{markdown}");
 }
 
 #[test]
