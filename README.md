@@ -102,7 +102,14 @@ app.log
 ```
 ````
 
-Nothing is installed on the other machine. termscribe sends a small startup script through the connection, starts zsh with it, and removes it when the shell ends. Your remote `~/.zshrc` runs as usual. The remote machine needs zsh. Without it you get your normal shell, and the whole session is one entry, as with plain `ssh`. A connection that runs a command (`termscribe ssh prod uptime`) is also left alone.
+Nothing is installed on the other machine. termscribe sends a small startup script through the connection, starts your login shell with it, and removes it when the shell ends. Your own startup files on that machine run as usual.
+
+The remote login shell must be zsh or bash. With anything else you get your normal shell, and the whole session is one entry, as with plain `ssh`. A connection that runs a command (`termscribe ssh prod uptime`) is also left alone.
+
+bash records a little less than zsh:
+- A line that bash rejects, such as a syntax error, leaves no entry. zsh records it with the error.
+- A line that starts with a space stays out only when `HISTCONTROL` contains `ignorespace` or `ignoreboth`, which is common on servers.
+- If your startup files already set a `DEBUG` trap, termscribe leaves bash alone and says so, and the session is one entry.
 
 Copy with Cmd+Alt+C, as everywhere else. Typing `termscribe` on the remote machine does not work, because the history lives on this machine. The remote shell shows no message when the shortcut copies.
 

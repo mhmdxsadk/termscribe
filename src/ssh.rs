@@ -12,7 +12,7 @@ use std::os::unix::process::CommandExt;
 use std::process::Command;
 
 use crate::ipc::SOCKET_ENV;
-use crate::shell::{NONCE_ENV, shell_word, shim_files};
+use crate::shell::{NONCE_ENV, bash_files, shell_word, shim_files};
 
 /// What to do with the arguments given to `termscribe ssh`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,11 +138,20 @@ const LAUNCHER: &str = r#"x=$(printf %s "$1" | base64 -d 2>/dev/null || printf %
 /// The `sh` script that runs on the other machine.
 fn remote_script(host: &str, nonce: &str) -> String {
     const END: &str = "TERMSCRIBE_END_OF_FILE";
+    // The user's login shell is the one to record, when termscribe knows it. A shell with no
+    // name falls back to whichever of the two is installed.
     let mut script = String::from(
-        r#"d=$(mktemp -d "${TMPDIR:-/tmp}/termscribe.XXXXXX" 2>/dev/null)
-if [ -z "$d" ] || ! command -v zsh >/dev/null 2>&1; then
-  echo "termscribe: zsh was not found on this machine, so this session is one command in the transcript." >&2
-  [ -n "$d" ] && rmdir "$d"
+        r#"pick=
+case "${SHELL##*/}" in
+  zsh|bash) pick=${SHELL##*/} ;;
+  "") for s in zsh bash; do if command -v "$s" >/dev/null 2>&1; then pick=$s; break; fi; done ;;
+esac
+d=
+if [ -n "$pick" ] && command -v "$pick" >/dev/null 2>&1; then
+  d=$(mktemp -d "${TMPDIR:-/tmp}/termscribe.XXXXXX" 2>/dev/null)
+fi
+if [ -z "$d" ]; then
+  echo "termscribe: it records zsh and bash, and the login shell on this machine is ${SHELL:-unknown}, so this session is one command in the transcript." >&2
   case "${SHELL##*/}" in bash|zsh|fish|ksh) exec "$SHELL" -l ;; esac
   exec "${SHELL:-/bin/sh}"
 fi
@@ -152,7 +161,7 @@ trap 'exit 143' TERM
 trap '' INT
 "#,
     );
-    for file in shim_files() {
+    for file in shim_files().into_iter().chain(bash_files()) {
         assert!(!file.content.lines().any(|line| line == END));
         script.push_str(&format!(
             "cat > \"$d/{}\" <<'{END}'\n{}{END}\n",
@@ -160,10 +169,14 @@ trap '' INT
             ensure_newline(&file.content)
         ));
     }
+    let host = shell_word(host);
     script.push_str(&format!(
-        "ZDOTDIR=$d TERMSCRIBE_USER_ZDOTDIR=${{ZDOTDIR-}} TERMSCRIBE_REMOTE={nonce} \
-         TERMSCRIBE_HOST={} zsh -l\nexit $?\n",
-        shell_word(host)
+        r#"case $pick in
+  zsh) ZDOTDIR=$d TERMSCRIBE_USER_ZDOTDIR=${{ZDOTDIR-}} TERMSCRIBE_REMOTE={nonce} TERMSCRIBE_HOST={host} zsh -l ;;
+  bash) TERMSCRIBE_REMOTE={nonce} TERMSCRIBE_HOST={host} bash --rcfile "$d/termscribe.bashrc" -i ;;
+esac
+exit $?
+"#
     ));
     script
 }
@@ -300,18 +313,27 @@ mod tests {
         let script = remote_script("my host", "abc123");
         assert!(script.contains("TERMSCRIBE_REMOTE=abc123"));
         assert!(script.contains("TERMSCRIBE_HOST='my host'"));
-        for name in [".zshenv", ".zprofile", ".zshrc", "termscribe.zsh"] {
+        for name in [
+            ".zshenv",
+            ".zprofile",
+            ".zshrc",
+            "termscribe.zsh",
+            "termscribe.bashrc",
+        ] {
             assert!(script.contains(&format!("\"$d/{name}\"")), "{name}");
         }
     }
 
     #[test]
-    fn the_script_parses() {
+    fn the_script_parses_in_strict_shells() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("remote.sh");
         std::fs::write(&path, remote_script("prod", "abc123")).expect("write");
-        if let Ok(status) = Command::new("sh").arg("-n").arg(&path).status() {
-            assert!(status.success());
+        // `sh` is dash on many servers. Shells that are not installed are skipped.
+        for shell in ["sh", "dash", "bash", "ksh"] {
+            if let Ok(status) = Command::new(shell).arg("-n").arg(&path).status() {
+                assert!(status.success(), "{shell} cannot parse the script");
+            }
         }
     }
 }
