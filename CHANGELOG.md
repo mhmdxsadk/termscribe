@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/mhmdxsadk/termscribe/compare/v0.3.1...v0.4.0) (2026-11-16)
+
+
+### Features
+
+* **ssh:** record commands run on another machine ([#8](https://github.com/mhmdxsadk/termscribe/issues/8)) ([d3222b1](https://github.com/mhmdxsadk/termscribe/commit/d3222b12deaf924aea4a919f6fdc715d7a101c11))
+
 ## [0.3.1](https://github.com/mhmdxsadk/termscribe/compare/v0.3.0...v0.3.1) (2026-11-12)
 
 
