@@ -37,15 +37,25 @@ pub fn format_markdown(transcript: &Transcript, options: &FormatOptions) -> Stri
         return String::new();
     }
     let mut lines: Vec<String> = Vec::new();
+    let mut previous_host: Option<&str> = None;
     let mut previous_cwd: Option<&str> = None;
     for record in &transcript.records {
-        let prompt = match record.cwd.as_deref() {
-            Some(cwd) if options.show_cwd && previous_cwd != Some(cwd) => format!("{cwd} $"),
-            _ => "$".to_string(),
+        let host = record.host.as_deref();
+        let host_changed = host != previous_host;
+        let cwd = record
+            .cwd
+            .as_deref()
+            .filter(|cwd| options.show_cwd && (host_changed || previous_cwd != Some(*cwd)));
+        let prompt = match (host.filter(|_| host_changed), cwd) {
+            (Some(host), Some(cwd)) => format!("{host}:{cwd} $"),
+            (Some(host), None) => format!("{host} $"),
+            (None, Some(cwd)) => format!("{cwd} $"),
+            (None, None) => "$".to_string(),
         };
-        if record.cwd.is_some() {
+        if host_changed || record.cwd.is_some() {
             previous_cwd = record.cwd.as_deref();
         }
+        previous_host = host;
         push_command(&mut lines, &prompt, &record.command);
         push_output(&mut lines, record, options);
     }
@@ -133,6 +143,41 @@ mod tests {
 
     fn record(command: &str, output: &str) -> CommandRecord {
         CommandRecord::new(command, output, Some(0))
+    }
+
+    #[test]
+    fn commands_on_another_machine_name_it_when_it_changes() {
+        let local = record("ls", "a").in_dir("~/proj");
+        let remote = |command: &str, cwd: &str| record(command, "").on_host("prod").in_dir(cwd);
+        assert_eq!(
+            render(vec![
+                local.clone(),
+                remote("uptime", "~"),
+                remote("cd srv", "~"),
+                remote("ls", "~/srv"),
+                remote("pwd", "~/srv"),
+                local,
+            ]),
+            "```\n~/proj $ ls\na\nprod:~ $ uptime\n$ cd srv\n~/srv $ ls\n$ pwd\n~/proj $ ls\na\n```\n"
+        );
+    }
+
+    #[test]
+    fn a_machine_without_a_directory_still_shows_its_name() {
+        let remote = |command: &str| record(command, "").on_host("prod");
+        assert_eq!(
+            render(vec![remote("uptime"), remote("whoami")]),
+            "```\nprod $ uptime\n$ whoami\n```\n"
+        );
+        let options = FormatOptions {
+            show_cwd: false,
+            ..FormatOptions::default()
+        };
+        let transcript = Transcript::new(vec![remote("a").in_dir("~"), remote("b").in_dir("~/x")]);
+        assert_eq!(
+            format_markdown(&transcript, &options),
+            "```\nprod $ a\n$ b\n```\n"
+        );
     }
 
     #[test]

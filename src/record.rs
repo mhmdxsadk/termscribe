@@ -17,6 +17,8 @@ pub struct CommandRecord {
     /// The directory the command ran in, when the shell reported it. The relay already
     /// replaced the home directory with `~`.
     pub cwd: Option<String>,
+    /// The machine the command ran on, when it was not this one (a `termscribe ssh` session).
+    pub host: Option<String>,
 }
 
 impl CommandRecord {
@@ -31,12 +33,19 @@ impl CommandRecord {
             truncated_bytes: 0,
             exit_code,
             cwd: None,
+            host: None,
         }
     }
 
     /// Sets the directory the command ran in.
     pub fn in_dir(mut self, cwd: impl Into<String>) -> Self {
         self.cwd = Some(cwd.into());
+        self
+    }
+
+    /// Sets the machine the command ran on.
+    pub fn on_host(mut self, host: impl Into<String>) -> Self {
+        self.host = Some(host.into());
         self
     }
 }

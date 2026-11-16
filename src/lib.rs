@@ -14,6 +14,7 @@ pub mod record;
 pub mod relay;
 pub mod screen;
 pub mod shell;
+pub mod ssh;
 pub mod store;
 pub mod transcript;
 pub mod zshrc;

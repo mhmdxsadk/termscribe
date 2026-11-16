@@ -24,6 +24,17 @@ pub enum Shell {
 pub const USER_ZDOTDIR_ENV: &str = "TERMSCRIBE_USER_ZDOTDIR";
 /// The environment variable that carries the path of the termscribe binary to the hooks.
 pub const BIN_ENV: &str = "TERMSCRIBE_BIN";
+/// The environment variable that carries the session's secret to the shell. `termscribe ssh`
+/// passes it on to the shell on the other machine.
+pub const NONCE_ENV: &str = "TERMSCRIBE_NONCE";
+
+/// Makes a secret for one session: 128 random bits as hex.
+pub fn new_nonce() -> io::Result<String> {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
 
 /// One file of the shim directory.
 pub struct ShimFile {
@@ -160,23 +171,35 @@ unset _termscribe_shim_dir TERMSCRIBE_USER_ZDOTDIR
 "#;
 
 const HOOKS: &str = r#"# termscribe session hooks. termscribe writes this file for each terminal session.
-if [[ -n $TERMSCRIBE_SOCKET && -z $_termscribe_loaded ]]; then
+# Inside a session, TERMSCRIBE_SOCKET names the relay. On another machine, `termscribe ssh`
+# sets TERMSCRIBE_REMOTE (the session's secret) and TERMSCRIBE_HOST instead. That shell only
+# sends marks through the connection, and the local relay does the rest.
+if [[ -z $_termscribe_loaded ]] && [[ -n $TERMSCRIBE_SOCKET || -n $TERMSCRIBE_REMOTE ]]; then
   typeset -g _termscribe_loaded=1
-  typeset -g _termscribe_bin=${TERMSCRIBE_BIN:-termscribe}
-  [[ -x $_termscribe_bin ]] || _termscribe_bin=termscribe
+  typeset -g _termscribe_remote=
+  [[ -z $TERMSCRIBE_SOCKET ]] && _termscribe_remote=1
 
-  # Ghostty loads its zsh integration only into a shell that it starts itself, and the relay
-  # started this one. Load it here. Without it Ghostty cannot tell where the prompt is, so Cmd+K
-  # stops telling the shell to redraw, and prompt jumping stops working.
-  if [[ -n $GHOSTTY_RESOURCES_DIR ]] && (( ! $+_ghostty_state )) \
-     && [[ -r $GHOSTTY_RESOURCES_DIR/shell-integration/zsh/ghostty-integration ]]; then
-    source "$GHOSTTY_RESOURCES_DIR/shell-integration/zsh/ghostty-integration"
+  if [[ -z $_termscribe_remote ]]; then
+    typeset -g _termscribe_bin=${TERMSCRIBE_BIN:-termscribe}
+    [[ -x $_termscribe_bin ]] || _termscribe_bin=termscribe
+
+    # Ghostty loads its zsh integration only into a shell that it starts itself, and the relay
+    # started this one. Load it here. Without it Ghostty cannot tell where the prompt is, so
+    # Cmd+K stops telling the shell to redraw, and prompt jumping stops working.
+    if [[ -n $GHOSTTY_RESOURCES_DIR ]] && (( ! $+_ghostty_state )) \
+       && [[ -r $GHOSTTY_RESOURCES_DIR/shell-integration/zsh/ghostty-integration ]]; then
+      source "$GHOSTTY_RESOURCES_DIR/shell-integration/zsh/ghostty-integration"
+    fi
   fi
 
   typeset -g _termscribe_line=
 
   _termscribe_mark() {
-    print -rn -- $'\e]7733;ts;'"$1"$'\a' >/dev/tty 2>/dev/null
+    if [[ -n $_termscribe_remote ]]; then
+      print -rn -- $'\e]7733;ts;@'"$TERMSCRIBE_REMOTE;$_termscribe_host;$1"$'\a' >/dev/tty 2>/dev/null
+    else
+      print -rn -- $'\e]7733;ts;'"$1"$'\a' >/dev/tty 2>/dev/null
+    fi
   }
 
   # Escapes text for a mark. The result is in REPLY, so no subshell is needed.
@@ -186,9 +209,20 @@ if [[ -n $TERMSCRIBE_SOCKET && -z $_termscribe_loaded ]]; then
     REPLY=${REPLY//$'\a'/%07}
   }
 
-  # The mark payload `<dir>;<command>` for the current directory and the given text.
+  typeset -g _termscribe_host=
+  if [[ -n $_termscribe_remote ]]; then
+    _termscribe_encode "$TERMSCRIBE_HOST"
+    _termscribe_host=${REPLY//;/%3B}
+  fi
+
+  # The mark payload `<dir>;<command>` for the current directory and the given text. On another
+  # machine the local relay cannot know where home is, so the directory is written with `~`.
   _termscribe_where_and_what() {
-    _termscribe_encode "$PWD"
+    local place=$PWD
+    if [[ -n $_termscribe_remote && -n $HOME && ( $PWD == "$HOME" || $PWD == "$HOME"/* ) ]]; then
+      place="~${PWD#"$HOME"}"
+    fi
+    _termscribe_encode "$place"
     local dir=${REPLY//;/%3B}
     _termscribe_encode "$1"
     REPLY="$dir;$REPLY"
@@ -229,24 +263,26 @@ if [[ -n $TERMSCRIBE_SOCKET && -z $_termscribe_loaded ]]; then
     _termscribe_mark "e;$code"
   }
 
-  # The copy shortcut reaches the shell only at a prompt. Show the result with zle -M.
-  _termscribe_copy_widget() {
-    local message
-    message=$(command "$_termscribe_bin" 2>&1)
-    zle -M -- "$message"
-  }
-  zle -N _termscribe_copy_widget
-  bindkey -M emacs '@TRIGGER@' _termscribe_copy_widget 2>/dev/null
-  bindkey -M viins '@TRIGGER@' _termscribe_copy_widget 2>/dev/null
-  bindkey -M vicmd '@TRIGGER@' _termscribe_copy_widget 2>/dev/null
-
   zshaddhistory_functions=(_termscribe_addhistory $zshaddhistory_functions)
   preexec_functions+=(_termscribe_preexec)
   precmd_functions=(_termscribe_precmd $precmd_functions)
 
-  # Short name for the command, unless something else already uses it.
-  if (( ! $+commands[ts] && ! $+functions[ts] && ! $+aliases[ts] )); then
-    ts() { command "$_termscribe_bin" "$@"; }
+  if [[ -z $_termscribe_remote ]]; then
+    # The copy shortcut reaches the shell only at a prompt. Show the result with zle -M.
+    _termscribe_copy_widget() {
+      local message
+      message=$(command "$_termscribe_bin" 2>&1)
+      zle -M -- "$message"
+    }
+    zle -N _termscribe_copy_widget
+    bindkey -M emacs '@TRIGGER@' _termscribe_copy_widget 2>/dev/null
+    bindkey -M viins '@TRIGGER@' _termscribe_copy_widget 2>/dev/null
+    bindkey -M vicmd '@TRIGGER@' _termscribe_copy_widget 2>/dev/null
+
+    # Short name for the command, unless something else already uses it.
+    if (( ! $+commands[ts] && ! $+functions[ts] && ! $+aliases[ts] )); then
+      ts() { command "$_termscribe_bin" "$@"; }
+    fi
   fi
 fi
 "#;

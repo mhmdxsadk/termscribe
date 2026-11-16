@@ -10,6 +10,11 @@
 //!   its error by then, so the relay supplies that output from what it saw after the Enter key.
 //! - `x` means a command started that must not be recorded.
 //! - `e;<status>` means the command ended and the shell is back at a prompt.
+//! - `@<nonce>;<host>;<mark>` wraps one of the marks above when it comes from a shell on another
+//!   machine, started by `termscribe ssh`. `<nonce>` is the secret that the session gave to that
+//!   shell, so the relay can tell it from output that merely looks like a mark. `<host>` is the
+//!   name the user knows the machine by, percent-encoded like a directory. The directory inside
+//!   the wrapped mark belongs to that machine, and its home is already written as `~`.
 //!
 //! The relay removes these marks before the terminal sees them.
 
@@ -37,6 +42,12 @@ pub enum Mark {
     StartUnrecorded,
     /// The command ended with this status.
     End(Option<i32>),
+    /// A mark from a shell on another machine.
+    Remote {
+        nonce: String,
+        host: String,
+        mark: Box<Mark>,
+    },
 }
 
 /// A piece of the stream after scanning.
@@ -130,6 +141,20 @@ fn find_terminator(bytes: &[u8]) -> Option<(usize, usize)> {
 
 fn parse_payload(payload: &[u8]) -> Option<Mark> {
     let text = std::str::from_utf8(payload).ok()?;
+    if let Some(wrapped) = text.strip_prefix('@') {
+        let (nonce, rest) = wrapped.split_once(';')?;
+        let (host, inner) = rest.split_once(';')?;
+        // A remote mark never wraps another remote mark.
+        let mark = match parse_payload(inner.as_bytes())? {
+            Mark::Remote { .. } => return None,
+            mark => mark,
+        };
+        return Some(Mark::Remote {
+            nonce: nonce.to_string(),
+            host: percent_decode(host),
+            mark: Box::new(mark),
+        });
+    }
     let (kind, rest) = text.split_once(';').unwrap_or((text, ""));
     match kind {
         "s" | "r" => {
@@ -171,7 +196,21 @@ fn percent_decode(text: &str) -> String {
 /// Encodes a mark. The zsh hooks do this in shell code. Tests and tooling use this version.
 pub fn encode(mark: &Mark) -> Vec<u8> {
     let mut out = PREFIX.to_vec();
+    encode_payload(mark, &mut out);
+    out.push(0x07);
+    out
+}
+
+fn encode_payload(mark: &Mark, out: &mut Vec<u8>) {
     match mark {
+        Mark::Remote { nonce, host, mark } => {
+            out.push(b'@');
+            out.extend_from_slice(nonce.as_bytes());
+            out.push(b';');
+            out.extend_from_slice(percent_encode(host).replace(';', "%3B").as_bytes());
+            out.push(b';');
+            encode_payload(mark, out);
+        }
         Mark::Start { cwd, command } | Mark::Rejected { cwd, command } => {
             out.extend_from_slice(if matches!(mark, Mark::Start { .. }) {
                 b"s;"
@@ -192,8 +231,6 @@ pub fn encode(mark: &Mark) -> Vec<u8> {
             }
         }
     }
-    out.push(0x07);
-    out
 }
 
 fn percent_encode(text: &str) -> String {
@@ -238,6 +275,46 @@ mod tests {
             command: "export X=<oops>".into(),
         };
         assert_eq!(scan_all(&[&encode(&mark)]), [Item::Mark(mark)]);
+    }
+
+    fn remote(mark: Mark) -> Mark {
+        Mark::Remote {
+            nonce: "ab12".into(),
+            host: "prod; box".into(),
+            mark: Box::new(mark),
+        }
+    }
+
+    #[test]
+    fn a_mark_from_another_machine_carries_its_nonce_and_host() {
+        for inner in [
+            Mark::Start {
+                cwd: Some("~/a;b".into()),
+                command: "echo 1;2".into(),
+            },
+            Mark::Rejected {
+                cwd: None,
+                command: "echo )".into(),
+            },
+            Mark::StartUnrecorded,
+            Mark::End(Some(3)),
+        ] {
+            let mark = remote(inner);
+            assert_eq!(scan_all(&[&encode(&mark)]), [Item::Mark(mark)]);
+        }
+    }
+
+    #[test]
+    fn a_remote_mark_without_a_host_or_a_mark_inside_is_dropped() {
+        assert_eq!(scan_all(&[b"a\x1b]7733;ts;@n\x07b"]), [data("ab")]);
+        assert_eq!(scan_all(&[b"a\x1b]7733;ts;@n;h\x07b"]), [data("ab")]);
+        assert_eq!(scan_all(&[b"a\x1b]7733;ts;@n;h;zzz\x07b"]), [data("ab")]);
+    }
+
+    #[test]
+    fn a_remote_mark_cannot_wrap_another_one() {
+        let stream = b"\x1b]7733;ts;@n;h;@m;h;e;0\x07";
+        assert_eq!(scan_all(&[stream]), []);
     }
 
     #[test]
