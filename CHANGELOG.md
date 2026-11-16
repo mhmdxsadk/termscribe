@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.2](https://github.com/mhmdxsadk/termscribe/compare/v0.5.1...v0.5.2) (2026-11-16)
+
+
+### Bug Fixes
+
+* **ssh:** let Ghostty send Cmd+K to a remote prompt ([#14](https://github.com/mhmdxsadk/termscribe/issues/14)) ([093342b](https://github.com/mhmdxsadk/termscribe/commit/093342b54df2f209b279bf280378a3fdc257d3ee))
+
 ## [0.5.1](https://github.com/mhmdxsadk/termscribe/compare/v0.5.0...v0.5.1) (2026-11-16)
 
 
