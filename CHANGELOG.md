@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/mhmdxsadk/termscribe/compare/v0.5.0...v0.5.1) (2026-11-16)
+
+
+### Bug Fixes
+
+* **ssh:** copy only the remote session while connected ([#12](https://github.com/mhmdxsadk/termscribe/issues/12)) ([176a607](https://github.com/mhmdxsadk/termscribe/commit/176a607f1e21aafb1a7cdedbacef6397e22618a7))
+
 ## [0.5.0](https://github.com/mhmdxsadk/termscribe/compare/v0.4.0...v0.5.0) (2026-11-16)
 
 
