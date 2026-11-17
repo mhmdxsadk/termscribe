@@ -87,63 +87,83 @@ fn strip_trailing_sgr(raw: &[u8], mut end: usize) -> usize {
     }
 }
 
-/// A minimal line model. It tracks one line and a cursor column, which is all that carriage
-/// returns, backspaces and erase-in-line need.
+/// A minimal screen model: the rows written so far and a cursor. That is enough for carriage
+/// returns, backspaces, erase-in-line, and programs that redraw a block of lines by moving the
+/// cursor up (`docker compose pull`, `npm install`).
 struct Screen {
-    lines: Vec<String>,
-    line: Vec<char>,
+    rows: Vec<Vec<char>>,
+    row: usize,
     col: usize,
 }
 
 impl Screen {
     fn new() -> Self {
         Self {
-            lines: Vec::new(),
-            line: Vec::new(),
+            rows: vec![Vec::new()],
+            row: 0,
             col: 0,
         }
     }
 
     fn put(&mut self, c: char) {
-        if self.col < self.line.len() {
-            self.line[self.col] = c;
+        let line = &mut self.rows[self.row];
+        if self.col < line.len() {
+            line[self.col] = c;
         } else {
-            while self.line.len() < self.col {
-                self.line.push(' ');
+            while line.len() < self.col {
+                line.push(' ');
             }
-            self.line.push(c);
+            line.push(c);
         }
         self.col += 1;
     }
 
     fn newline(&mut self) {
-        let line: String = self.line.iter().collect();
-        self.lines.push(line.trim_end().to_string());
-        self.line.clear();
+        self.down(1);
         self.col = 0;
     }
 
-    fn erase_in_line(&mut self, mode: usize) {
-        match mode {
-            0 => self.line.truncate(self.col),
-            1 => {
-                let upto = self.col.min(self.line.len());
-                for cell in &mut self.line[..upto] {
-                    *cell = ' ';
-                }
-            }
-            _ => self.line.clear(),
+    fn up(&mut self, n: usize) {
+        self.row = self.row.saturating_sub(n);
+    }
+
+    fn down(&mut self, n: usize) {
+        self.row += n;
+        while self.rows.len() <= self.row {
+            self.rows.push(Vec::new());
         }
     }
 
-    fn finish(mut self) -> String {
-        if !self.line.is_empty() {
-            self.newline();
+    fn erase_in_line(&mut self, mode: usize) {
+        let line = &mut self.rows[self.row];
+        match mode {
+            0 => line.truncate(self.col),
+            1 => {
+                let upto = self.col.min(line.len());
+                for cell in &mut line[..upto] {
+                    *cell = ' ';
+                }
+            }
+            _ => line.clear(),
         }
-        while self.lines.last().is_some_and(|line| line.is_empty()) {
-            self.lines.pop();
+    }
+
+    /// Erase from the cursor to the end of the screen.
+    fn erase_below(&mut self) {
+        self.rows[self.row].truncate(self.col);
+        self.rows.truncate(self.row + 1);
+    }
+
+    fn finish(self) -> String {
+        let mut lines: Vec<String> = self
+            .rows
+            .into_iter()
+            .map(|row| row.into_iter().collect::<String>().trim_end().to_string())
+            .collect();
+        while lines.last().is_some_and(|line| line.is_empty()) {
+            lines.pop();
         }
-        self.lines.join("\n")
+        lines.join("\n")
     }
 }
 
@@ -211,6 +231,11 @@ fn escape(
             }
             i
         }
+        // Reverse index: cursor up one line.
+        'M' => {
+            screen.up(1);
+            i
+        }
         // Character-set selection and similar take one more character.
         '(' | ')' | '*' | '+' | '#' | '%' => (i + 1).min(chars.len()),
         _ => i,
@@ -244,6 +269,17 @@ fn csi(
         .and_then(|p| p.parse::<usize>().ok());
     match final_char {
         'K' => screen.erase_in_line(first.unwrap_or(0)),
+        'J' if first.unwrap_or(0) == 0 => screen.erase_below(),
+        'A' => screen.up(first.unwrap_or(1).max(1)),
+        'B' => screen.down(first.unwrap_or(1).max(1)),
+        'E' => {
+            screen.down(first.unwrap_or(1).max(1));
+            screen.col = 0;
+        }
+        'F' => {
+            screen.up(first.unwrap_or(1).max(1));
+            screen.col = 0;
+        }
         'C' => screen.col += first.unwrap_or(1).max(1),
         'D' => screen.col = screen.col.saturating_sub(first.unwrap_or(1).max(1)),
         'G' => screen.col = first.unwrap_or(1).max(1) - 1,
@@ -353,6 +389,39 @@ mod tests {
     fn erase_line_after_return_clears_the_old_text() {
         assert_eq!(text("working...\r\x1b[Kdone\n"), "done");
         assert_eq!(text("working...\r\x1b[2Kdone\n"), "done");
+    }
+
+    #[test]
+    fn a_block_redrawn_by_moving_the_cursor_up_keeps_only_its_last_state() {
+        let frame = |n: u32, done: bool| {
+            let spin = if done { "✔" } else { "⠋" };
+            format!("[+] Pulling {n}/1\r\n {spin} app Pulling\r\n")
+        };
+        let raw = format!(
+            "{}\x1b[2A\x1b[0G\x1b[0K{}\x1b[2A\x1b[0G\x1b[0K{}",
+            frame(0, false),
+            frame(0, false),
+            frame(1, true)
+        )
+        .replace("\r\n", "\x1b[0K\r\n");
+        assert_eq!(text(&raw), "[+] Pulling 1/1\n ✔ app Pulling");
+    }
+
+    #[test]
+    fn a_redraw_that_prints_fewer_lines_erases_the_rest_with_erase_below() {
+        assert_eq!(text("one\ntwo\nthree\n\x1b[3A\x1b[Jdone\n"), "done");
+    }
+
+    #[test]
+    fn cursor_down_and_line_moves_work() {
+        assert_eq!(text("a\nb\x1b[1Ac\x1b[1Bd\n"), "ac\nb d");
+        assert_eq!(text("one\ntwo\x1b[1Fx\n"), "xne\ntwo");
+        assert_eq!(text("one\ntwo\x1bMx\n"), "onex\ntwo");
+    }
+
+    #[test]
+    fn moving_up_past_the_first_line_stops_there() {
+        assert_eq!(text("a\n\x1b[9Ab\n"), "b");
     }
 
     #[test]
