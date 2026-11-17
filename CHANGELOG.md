@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.3](https://github.com/mhmdxsadk/termscribe/compare/v0.5.2...v0.5.3) (2026-11-17)
+
+
+### Bug Fixes
+
+* **clean:** keep only the last state of output redrawn with cursor-up ([379a9aa](https://github.com/mhmdxsadk/termscribe/commit/379a9aa7ec1170de9cc470bfdd69a7383e446c84))
+* **clean:** keep only the last state of output redrawn with cursor-up ([6489ab8](https://github.com/mhmdxsadk/termscribe/commit/6489ab855ea745a15662a7748b6edd65809757aa))
+
 ## [0.5.2](https://github.com/mhmdxsadk/termscribe/compare/v0.5.1...v0.5.2) (2026-11-16)
 
 
